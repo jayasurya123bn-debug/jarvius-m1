@@ -282,15 +282,20 @@ class LiveSpeechListener:
                 if d.get("max_input_channels", 0) > 0:
                     name = d.get("name", "").lower()
                     score = 0
-                    if "microphone array" in name or "array" in name:
+                    if any(k in name for k in ("headset", "hands-free", "m19", "p47", "boult", "airbass", "zyio", "bluetooth")):
+                        score += 30
+                    elif "usb" in name:
+                        score += 20
+                    elif "microphone array" in name or "array" in name:
                         score += 10
-                    elif "headset" in name or "usb" in name or "mic" in name:
+                    elif "mic" in name:
                         score += 8
                     if "mapper" in name or "primary" in name:
                         score -= 5
                     candidates.append((score, i, d["name"]))
             candidates.sort(key=lambda x: x[0], reverse=True)
             if candidates and candidates[0][0] > 0:
+                print(f"[STT] Auto-selected preferred audio device [{candidates[0][1]}]: {candidates[0][2]}")
                 return candidates[0][1]
         except Exception:
             pass

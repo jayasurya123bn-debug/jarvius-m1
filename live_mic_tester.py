@@ -52,18 +52,19 @@ def get_best_input_device():
     for i, d in enumerate(devices):
         if d.get("max_input_channels", 0) > 0:
             name = d.get("name", "").lower()
-            if any(k in name for k in ("headset", "m19", "p47", "zyio", "bluetooth")):
+            if any(k in name for k in ("headset", "hands-free", "m19", "p47", "boult", "airbass", "zyio", "bluetooth")):
                 headset_idx = i
+                break
             elif "microphone array" in name or "realtek" in name:
                 if realtek_idx is None:
                     realtek_idx = i
 
     if headset_idx is not None:
         return headset_idx, devices[headset_idx]["name"]
-    if realtek_idx is not None:
-        return realtek_idx, devices[realtek_idx]["name"]
     if default_idx is not None and default_idx >= 0:
         return default_idx, devices[default_idx]["name"]
+    if realtek_idx is not None:
+        return realtek_idx, devices[realtek_idx]["name"]
     return 1, "Microphone Array"
 
 def main():
