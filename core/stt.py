@@ -199,16 +199,17 @@ DEFAULT_WAKE_WORDS = [
     "jarves",
     "jaavis",
     "charvis",
+    "ஜார்விஸ்",
 ]
 
 _WAKE_REGEX = re.compile(
-    r"^\s*(?:(?:hey|hi|hello|ok|okay|yo|a|eh)\s+)?(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis)\b[\s,:\-–]*(.*)$",
-    re.IGNORECASE
+    r"^\s*(?:(?:hey|hi|hello|ok|okay|yo|a|eh)\s+)?(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis|ஜார்விஸ்)(?:\b|\s|$)[\s,:\-–]*(.*)$",
+    re.IGNORECASE | re.UNICODE
 )
 
 _EMBEDDED_WAKE_REGEX = re.compile(
-    r"\b(?:(?:hey|hi|hello|ok|okay|yo|a|eh)\s+)?(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis)\b",
-    re.IGNORECASE
+    r"(?:(?:\b|^)(?:hey|hi|hello|ok|okay|yo|a|eh)\s+)?(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis|ஜார்விஸ்)(?:\b|\s|$)",
+    re.IGNORECASE | re.UNICODE
 )
 
 
@@ -270,6 +271,31 @@ class LiveSpeechListener:
         "nillu", "niruthu", "pothum"
     }
 
+    @staticmethod
+    def get_preferred_mic_index() -> int | None:
+        """Find the most suitable working microphone index on Windows."""
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            candidates = []
+            for i, d in enumerate(devices):
+                if d.get("max_input_channels", 0) > 0:
+                    name = d.get("name", "").lower()
+                    score = 0
+                    if "microphone array" in name or "array" in name:
+                        score += 10
+                    elif "headset" in name or "usb" in name or "mic" in name:
+                        score += 8
+                    if "mapper" in name or "primary" in name:
+                        score -= 5
+                    candidates.append((score, i, d["name"]))
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            if candidates and candidates[0][0] > 0:
+                return candidates[0][1]
+        except Exception:
+            pass
+        return None
+
     def __init__(
         self,
         device_index: int | None = None,
@@ -293,7 +319,11 @@ class LiveSpeechListener:
     ):
         import speech_recognition as sr
         self.sr = sr
-        self.device_index = device_index
+        # Auto-resolve preferred microphone index if none provided
+        if device_index is None:
+            self.device_index = self.get_preferred_mic_index()
+        else:
+            self.device_index = device_index
         self.language = language or "en-IN"
         self.pause_threshold = pause_threshold
         self.phrase_time_limit = phrase_time_limit
@@ -319,6 +349,7 @@ class LiveSpeechListener:
         self.recognizer.pause_threshold = self.pause_threshold
         self.recognizer.phrase_threshold = 0.3
         self.recognizer.non_speaking_duration = 0.5
+        self.recognizer.energy_threshold = 300.0
 
         self.microphone = None
         self._thread = None
@@ -402,12 +433,18 @@ class LiveSpeechListener:
                     self.microphone = source
                     print(f"[STT] Calibrating microphone for ambient noise (device={self.device_index})...")
                     self.recognizer.adjust_for_ambient_noise(source, duration=0.8)
+                    # Enforce safe minimum threshold (never drop below 250 to avoid infinite listening buffer on quiet noise floor)
+                    self.recognizer.energy_threshold = max(250.0, min(self.recognizer.energy_threshold, 1800.0))
+                    self.recognizer.dynamic_energy_threshold = False
                     print(f"[STT] Mic calibrated. Energy threshold: {self.recognizer.energy_threshold:.1f}")
                     if self.log_fn:
-                        self.log_fn("SYS: Voice-to-Text mic calibrated and active.")
+                        self.log_fn(f"SYS: Voice-to-Text mic calibrated (energy threshold: {self.recognizer.energy_threshold:.0f}).")
 
                     # Inner continuous capture loop with persistent stream
                     while self._running:
+                        # Prevent threshold from drifting below safe floor
+                        if self.recognizer.energy_threshold < 200.0:
+                            self.recognizer.energy_threshold = 250.0
                         speaking = bool(self.is_speaking_fn and self.is_speaking_fn())
                         muted = bool(self.is_muted_fn and self.is_muted_fn())
 
@@ -439,7 +476,11 @@ class LiveSpeechListener:
                                 try:
                                     text = self.recognizer.recognize_google(audio, language=self.language).strip()
                                 except Exception:
-                                    continue
+                                    try:
+                                        alt_lang = "ta-IN" if self.language in ("en-IN", "en-US") else "en-IN"
+                                        text = self.recognizer.recognize_google(audio, language=alt_lang).strip()
+                                    except Exception:
+                                        continue
 
                                 if not text:
                                     continue
@@ -517,20 +558,27 @@ class LiveSpeechListener:
                             except Exception:
                                 pass
 
-                        # Convert speech to text
+                        # Convert speech to text with bilingual fallback
                         text = None
                         try:
                             text = self.recognizer.recognize_google(audio, language=self.language).strip()
                         except self.sr.UnknownValueError:
-                            print("[STT] 👂 Sound detected, but words were not clear (ambient sound or whisper).")
-                            continue
+                            # Try alternate language (Tamil ta-IN or English en-IN)
+                            alt_lang = "ta-IN" if self.language in ("en-IN", "en-US") else "en-IN"
+                            try:
+                                text = self.recognizer.recognize_google(audio, language=alt_lang).strip()
+                            except Exception:
+                                text = None
+                            if not text:
+                                print("[STT] 👂 Sound detected, but words were not clear (ambient sound or whisper).")
+                                continue
                         except self.sr.RequestError as e:
-                            # Retry with en-US if specific locale failed
-                            if self.language != "en-US":
-                                try:
-                                    text = self.recognizer.recognize_google(audio, language="en-US").strip()
-                                except Exception:
-                                    text = None
+                            # Retry with alternate locale if service error
+                            alt_lang = "ta-IN" if self.language in ("en-IN", "en-US") else "en-US"
+                            try:
+                                text = self.recognizer.recognize_google(audio, language=alt_lang).strip()
+                            except Exception:
+                                text = None
                             if not text:
                                 print(f"[STT] Recognition service error: {e}")
                                 if self.log_fn:

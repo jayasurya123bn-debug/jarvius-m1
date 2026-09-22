@@ -49,7 +49,17 @@ sc3.Description = "Terminate all JARVIS background processes"
 sc3.Save()
 print("Stop JARVIS Shortcut created at:", desktop / "Stop JARVIS.lnk")
 
-# 4. Remove obsolete Voice Training shortcut if present
+# 4. Create Mic Test shortcut
+test_bat = base_dir / "test_mic.bat"
+sc4 = shell.CreateShortcut(str(desktop / "JARVIS Mic Test.lnk"))
+sc4.TargetPath = str(test_bat)
+sc4.WorkingDirectory = str(base_dir)
+sc4.IconLocation = f"{icon_path},0"
+sc4.Description = "JARVIS Live Microphone and Voice Tester"
+sc4.Save()
+print("Mic Test Shortcut created at:", desktop / "JARVIS Mic Test.lnk")
+
+# 5. Remove obsolete Voice Training shortcut if present
 old_vt = desktop / "JARVIS Voice Training.lnk"
 if old_vt.exists():
     try:
