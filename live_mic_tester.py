@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-JARVIS Live Microphone & Voice Debugger
-Visual real-time audio VU meter, live speech recognition,
-wake-word validator, and audible voice response feedback.
+JARVIS Real-Time Interactive Live Microphone & Voice Tester
+Features:
+- Live bouncing ASCII VU meter updating in real-time.
+- Instant feedback if hardware microphone is muted (Fn+F4 on Lenovo).
+- Automatic speech segmentation and Google STT recognition.
+- Wake word validation ('Hey Jarvis', 'Hey Jarvius', 'ஜார்விஸ்').
+- Audio speech confirmation back via speakers.
 """
 
 import sys
 import os
 import time
 import json
-import threading
 from pathlib import Path
 
-# Ensure UTF-8 output on Windows console
+# Ensure UTF-8 console output on Windows
 for stream in (sys.stdout, sys.stderr):
     try:
         stream.reconfigure(encoding="utf-8", errors="replace")
@@ -26,126 +29,190 @@ import speech_recognition as sr
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-from core.stt import parse_wake_word, LiveSpeechListener
+from core.stt import parse_wake_word
 
 def speak_offline(text: str):
-    """Speak short audio confirmation using pyttsx3 SAPI5."""
+    """Audible response via pyttsx3 SAPI5."""
     try:
         import pyttsx3
         engine = pyttsx3.init()
         engine.setProperty("rate", 185)
         engine.say(text)
         engine.runAndWait()
-    except Exception as e:
-        print(f"[TTS Error: {e}]")
+    except Exception:
+        pass
 
-def get_configured_mic_index() -> int:
-    """Read mic_device_index from config or auto-detect."""
-    if CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            idx = cfg.get("mic_device_index")
-            if idx is not None:
-                return int(idx)
-        except Exception:
-            pass
-    # Fallback to auto-detection
-    idx = LiveSpeechListener.get_preferred_mic_index()
-    return idx if idx is not None else 1
+def get_best_input_device():
+    """Find the best input device: prioritize connected headset, then Realtek array."""
+    devices = sd.query_devices()
+    headset_idx = None
+    realtek_idx = None
+    default_idx = sd.default.device[0]
+
+    for i, d in enumerate(devices):
+        if d.get("max_input_channels", 0) > 0:
+            name = d.get("name", "").lower()
+            if any(k in name for k in ("headset", "m19", "p47", "zyio", "bluetooth")):
+                headset_idx = i
+            elif "microphone array" in name or "realtek" in name:
+                if realtek_idx is None:
+                    realtek_idx = i
+
+    if headset_idx is not None:
+        return headset_idx, devices[headset_idx]["name"]
+    if realtek_idx is not None:
+        return realtek_idx, devices[realtek_idx]["name"]
+    if default_idx is not None and default_idx >= 0:
+        return default_idx, devices[default_idx]["name"]
+    return 1, "Microphone Array"
 
 def main():
     print("=" * 75)
-    print("       🎙️   JARVIS INTERACTIVE LIVE MICROPHONE & VOICE DEBUGGER   🎙️")
+    print("      🎙️   JARVIS REAL-TIME MICROPHONE & VOICE LIVE TESTER   🎙️")
     print("=" * 75)
 
-    mic_idx = get_configured_mic_index()
-    try:
-        dev_info = sd.query_devices(mic_idx)
-        mic_name = dev_info.get("name", "Unknown")
-    except Exception:
-        mic_name = f"Device [{mic_idx}]"
+    dev_idx, dev_name = get_best_input_device()
+    sample_rate = 16000
+    chunk_size = 1024
 
-    print(f"  • Target Microphone:  Device [{mic_idx}] '{mic_name}'")
-    print(f"  • Safe Energy Floor:  250.0")
-    print(f"  • Languages:          en-IN (English India) & ta-IN (Tamil)")
-    print(f"  • Wake Words:         'Hey Jarvis', 'Hey Jarvius', 'Jarvis', 'ஜார்விஸ்'")
+    print(f"  • Selected Device: [{dev_idx}] {dev_name}")
+    print(f"  • Sample Rate:     {sample_rate} Hz Mono")
+    print(f"  • Wake Words:      'Hey Jarvis', 'Hey Jarvius', 'Jarvis', 'ஜார்விஸ்'")
     print("=" * 75)
-    print("\n👉 SPEAK INTO YOUR MICROPHONE NOW! (e.g. say: 'Hey Jarvis test mic')")
-    print("   Press Ctrl+C anytime to exit.\n")
+    print("\n[INSTRUCTIONS]")
+    print("  1. Watch the live audio meter [■■■■■■░░░░] below.")
+    print("  2. Speak into your microphone (e.g. 'Hey Jarvis test voice').")
+    print("  3. If meter stays at 0, check [Fn + F4] on your Lenovo keyboard to unmute.")
+    print("  4. Press Ctrl+C anytime to exit.\n")
 
     r = sr.Recognizer()
-    r.dynamic_energy_threshold = False
-    r.energy_threshold = 280.0
-    r.pause_threshold = 0.8
 
     try:
-        mic = sr.Microphone(device_index=mic_idx)
+        stream = sd.InputStream(
+            device=dev_idx,
+            channels=1,
+            samplerate=sample_rate,
+            dtype="int16",
+            blocksize=chunk_size
+        )
+        stream.start()
     except Exception as e:
-        print(f"[!] Error opening microphone {mic_idx}: {e}. Falling back to default.")
-        mic = sr.Microphone()
+        print(f"[!] Error opening audio device {dev_idx}: {e}")
+        try:
+            stream = sd.InputStream(
+                channels=1,
+                samplerate=sample_rate,
+                dtype="int16",
+                blocksize=chunk_size
+            )
+            stream.start()
+            print("  -> Fallen back to system default input stream.")
+        except Exception as e2:
+            print(f"[FATAL] Could not open audio input: {e2}")
+            return
 
-    with mic as source:
-        print("Calibrating ambient noise level (0.8s)...")
-        r.adjust_for_ambient_noise(source, duration=0.8)
-        ambient_cal = r.energy_threshold
-        r.energy_threshold = max(250.0, min(ambient_cal, 1800.0))
-        r.dynamic_energy_threshold = False
-        print(f"Calibration complete! Ambient floor: {ambient_cal:.1f} -> Clamped threshold: {r.energy_threshold:.1f}\n")
+    speech_buffer = []
+    is_speaking = False
+    silence_chunks = 0
+    max_silence_chunks = int(0.7 * (sample_rate / chunk_size))  # ~0.7s silence to finish phrase
+    min_speech_chunks = int(0.4 * (sample_rate / chunk_size))   # min ~0.4s to qualify as phrase
 
-        print("-" * 75)
-        print(" [READY] Listening for your voice... Speak now!")
-        print("-" * 75)
+    SPEECH_THRESHOLD = 200  # RMS threshold for speech trigger
+    muted_warned = False
+    zero_count = 0
 
-        turn = 1
+    try:
         while True:
-            try:
-                print(f"\n[Turn {turn}] 👂 Waiting for speech...")
-                audio = r.listen(source, timeout=10.0, phrase_time_limit=12.0)
-                byte_len = len(audio.frame_data)
-                print(f"[Turn {turn}] 🎙️ Audio captured ({byte_len:,} bytes). Sending to Speech-to-Text...")
+            data, overflowed = stream.read(chunk_size)
+            audio_np = data.flatten()
+            peak = int(np.max(np.abs(audio_np)))
+            rms = float(np.sqrt(np.mean(audio_np.astype(np.float32)**2)))
 
-                # Recognition with bilingual retry
-                text = None
-                try:
-                    text = r.recognize_google(audio, language="en-IN").strip()
-                except sr.UnknownValueError:
-                    try:
-                        text = r.recognize_google(audio, language="ta-IN").strip()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"  [STT Error]: {e}")
+            # Track zero signal
+            if peak <= 1:
+                zero_count += 1
+            else:
+                zero_count = 0
+                muted_warned = False
 
-                if not text:
-                    print(f"  ⚪ Audio received, but words were not decipherable. Please speak a little louder or closer to the mic.")
-                    continue
+            # Draw visual meter
+            bars = "■" * min(25, int((rms / 500) * 25))
+            status = "🟢 SPEAKING" if is_speaking else ("👂 LISTENING" if peak > 5 else "🔴 ZERO/MUTED")
+            meter_line = f"\r[Signal: {bars:25s}] Peak:{peak:5d} | RMS:{int(rms):4d} | Status: {status}   "
+            sys.stdout.write(meter_line)
+            sys.stdout.flush()
 
-                print(f"  🟢 RECOGNIZED TEXT: \"{text}\"")
+            # Hardware mute alert if flatline zeros for 3 seconds
+            if zero_count > 45 and not muted_warned:
+                muted_warned = True
+                print("\n\n" + "-" * 75)
+                print("  ⚠️  ATTENTION: Microphone signal is strictly ZERO (Flatline)!")
+                print("  Your Lenovo laptop microphone is currently HARDWARE MUTED.")
+                print("  👉 Look at your keyboard: Press [Fn + F4] (or [F4]) to toggle the mic!")
+                print("  👉 Make sure the orange light on the F4 key is OFF.")
+                print("  👉 Or check the 'Recording' sound window on your screen.")
+                print("-" * 75 + "\n")
 
-                # Test wake word
-                is_wake, cmd, wake_word = parse_wake_word(text)
-                if is_wake:
-                    print(f"  ⚡ WAKE WORD DETECTED: '{wake_word}'")
-                    print(f"  🚀 COMMAND EXTRACTED:  '{cmd}'")
-                    reply = f"Voice received, Sir! Wake word '{wake_word}' confirmed."
-                    print(f"  🔊 Speaking: \"{reply}\"")
-                    speak_offline(reply)
-                else:
-                    print(f"  ℹ️  No wake word in phrase (say 'Hey Jarvis' or 'Hey Jarvius' to trigger wake)")
-                    reply = f"Heard: {text}"
-                    print(f"  🔊 Speaking: \"{reply}\"")
-                    speak_offline(reply)
+            # Speech start detection
+            if rms >= SPEECH_THRESHOLD:
+                if not is_speaking:
+                    is_speaking = True
+                    speech_buffer = []
+                speech_buffer.append(audio_np.tobytes())
+                silence_chunks = 0
+            elif is_speaking:
+                speech_buffer.append(audio_np.tobytes())
+                silence_chunks += 1
 
-                turn += 1
+                if silence_chunks >= max_silence_chunks:
+                    # Phrase finished!
+                    is_speaking = False
+                    if len(speech_buffer) >= min_speech_chunks:
+                        raw_bytes = b"".join(speech_buffer)
+                        speech_buffer = []
+                        print("\n\n" + "=" * 60)
+                        print(f"  🎙️ Captured phrase ({len(raw_bytes):,} bytes). Transcribing...")
+                        print("=" * 60)
 
-            except sr.WaitTimeoutError:
-                print("  ⏳ [No speech detected in last 10 seconds. Still listening...]")
-            except KeyboardInterrupt:
-                print("\n\n[Exited] Voice debugging finished.")
-                break
-            except Exception as e:
-                print(f"\n[!] Error during listening: {e}")
-                time.sleep(1.0)
+                        audio_data = sr.AudioData(raw_bytes, sample_rate, 2)
+                        text = None
+                        try:
+                            text = r.recognize_google(audio_data, language="en-IN").strip()
+                        except sr.UnknownValueError:
+                            try:
+                                text = r.recognize_google(audio_data, language="ta-IN").strip()
+                            except Exception:
+                                pass
+                        except Exception as err:
+                            print(f"  [STT Network error]: {err}")
+
+                        if text:
+                            print(f"\n  🗣 HEARD: \"{text}\"")
+                            is_wake, cmd, wake_word = parse_wake_word(text)
+                            if is_wake:
+                                print(f"  ⚡ WAKE WORD: '{wake_word}' (MATCHED!)")
+                                print(f"  🚀 COMMAND:   '{cmd}'")
+                                ans = f"Yes Sir, I heard {text}."
+                            else:
+                                print(f"  ℹ️ (No wake word detected. Say 'Hey Jarvis' or 'Hey Jarvius')")
+                                ans = f"I heard: {text}"
+                            print(f"  🔊 Speaking: \"{ans}\"")
+                            speak_offline(ans)
+                        else:
+                            print("  ⚪ Sound detected, but words were not clear. Try speaking louder or closer.")
+
+                        print("\n" + "-" * 60)
+                        print(" [READY] Listening again... Speak anytime!")
+                        print("-" * 60 + "\n")
+
+    except KeyboardInterrupt:
+        print("\n\n[Exited] Live mic tester stopped.")
+    finally:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
