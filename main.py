@@ -666,11 +666,20 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _speak_local(self, text: str) -> None:
-        """Speak text immediately using local pyttsx3 in a background thread."""
+        """Speak text immediately using local EdgeTTS (for Tamil/English) or pyttsx3 in a background thread."""
         def _do():
             with self._tts_lock:
                 try:
                     self.set_speaking(True)
+                    import re
+                    has_tamil = bool(re.search(r"[\u0B80-\u0BFF]", text))
+                    if has_tamil:
+                        try:
+                            from core.tts import EdgeTTSEngine
+                            EdgeTTSEngine(tamil_voice="ta-IN-ValluvarNeural").speak(text)
+                            return
+                        except Exception:
+                            pass
                     import pyttsx3
                     engine = pyttsx3.init()
                     engine.setProperty("rate", 185)
@@ -723,10 +732,30 @@ class JarvisLive:
         """Execute common desktop and system commands locally without requiring Gemini Live."""
         t = text.lower().strip().rstrip(".!?")
 
-        # 1. App opening
+        # 1. Tamil Greetings & Common Phrases
+        if any(k in t for k in ("வணக்கம்", "vanakkam", "வாழ்க வளமுடன்")):
+            msg = "வணக்கம் சார்! நான் நலமாக இருக்கிறேன், சொல்லுங்கள் உங்களுக்கு என்ன உதவி வேண்டும்?"
+            self.ui.write_log(f"JARVIS: {msg}")
+            self._speak_local(msg)
+            return True
+
+        if any(k in t for k in ("எப்படி இருக்க", "eppadi irukka", "how are you")):
+            msg = "நான் எப்போதும் போல சிறப்பாக செயல்படுகிறேன் சார். சொல்லுங்கள் என்ன செய்ய வேண்டும்?"
+            self.ui.write_log(f"JARVIS: {msg}")
+            self._speak_local(msg)
+            return True
+
+        # 2. App opening (English & Tamil/Tanglish: "open chrome", "chrome open pannu", "youtube open")
+        app_name = None
         if t.startswith("open ") or t.startswith("launch ") or t.startswith("start "):
-            app_name = t.split(" ", 1)[1].strip()
-            app_name = re.sub(r"^(the|app|application)\s+", "", app_name).strip()
+            raw = t.split(" ", 1)[1].strip()
+            app_name = re.sub(r"^(the|app|application)\s+", "", raw).strip()
+        else:
+            m_rev = re.search(r"^(.+?)\s+(?:open|launch|start)(?:\s+pannu|\s+pannunga|\s+பண்ணு)?$", t)
+            if m_rev:
+                app_name = m_rev.group(1).strip()
+
+        if app_name:
             self.ui.write_log(f"SYS: Executing local open_app: '{app_name}'")
             try:
                 loop = asyncio.get_event_loop()
@@ -739,7 +768,41 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Local Command] open_app error: {e}")
 
-        # 2. Volume and audio controls
+        # 3. Spotify and media controls
+        if any(k in t for k in ("spotify", "music", "song", "track")):
+            try:
+                loop = asyncio.get_event_loop()
+                from actions.desktop import desktop_control
+                if "next" in t or "skip" in t:
+                    await loop.run_in_executor(None, lambda: desktop_control({"action": "media_next"}, self.ui))
+                    msg = "Skipped to next track, Sir."
+                elif "previous" in t or "back" in t:
+                    await loop.run_in_executor(None, lambda: desktop_control({"action": "media_prev"}, self.ui))
+                    msg = "Playing previous track, Sir."
+                elif "pause" in t or "stop" in t:
+                    await loop.run_in_executor(None, lambda: desktop_control({"action": "media_play_pause"}, self.ui))
+                    msg = "Music paused, Sir."
+                elif "play" in t or "resume" in t:
+                    match = re.search(r"play\s+(.+?)(?:\s+on\s+spotify)?$", t)
+                    if match and match.group(1).strip() not in ("music", "song", ""):
+                        query = match.group(1).strip()
+                        from actions.open_app import open_app
+                        await loop.run_in_executor(None, lambda: open_app({"app_name": "spotify"}, None, self.ui))
+                        import webbrowser
+                        webbrowser.open(f"https://open.spotify.com/search/{query}")
+                        msg = f"Playing {query} on Spotify, Sir."
+                    else:
+                        await loop.run_in_executor(None, lambda: desktop_control({"action": "media_play_pause"}, self.ui))
+                        msg = "Resuming music playback, Sir."
+                else:
+                    msg = "Media command executed, Sir."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return True
+            except Exception as e:
+                print(f"[Local Command] spotify error: {e}")
+
+        # 4. Volume and audio controls
         if any(k in t for k in ("volume", "mute", "unmute", "sound")):
             act = "toggle_mute"
             val = None
@@ -772,23 +835,23 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Local Command] volume error: {e}")
 
-        # 3. Time query
-        if any(k in t for k in ("what time", "what's the time", "current time", "tell me the time", "time now", "what is the time")):
+        # 5. Time query
+        if any(k in t for k in ("what time", "what's the time", "current time", "tell me the time", "time now", "what is the time", "மணி என்ன")):
             time_now = datetime.now().strftime("%I:%M %p")
             msg = f"It is currently {time_now}, Sir."
             self.ui.write_log(f"JARVIS: {msg}")
             self._speak_local(msg)
             return True
 
-        # 4. Date query
-        if any(k in t for k in ("what date", "today's date", "what is the date", "what's today's date", "which day is today")):
+        # 6. Date query
+        if any(k in t for k in ("what date", "today's date", "what is the date", "what's today's date", "which day is today", "இன்று என்ன தேதி")):
             date_now = datetime.now().strftime("%A, %B %d, %Y")
             msg = f"Today is {date_now}, Sir."
             self.ui.write_log(f"JARVIS: {msg}")
             self._speak_local(msg)
             return True
 
-        # 5. System status
+        # 7. System status
         if any(k in t for k in ("system status", "battery", "cpu", "ram", "performance", "pc status")):
             try:
                 import psutil
@@ -803,7 +866,7 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Local Command] status error: {e}")
 
-        # 6. Screenshot
+        # 8. Screenshot
         if "screenshot" in t or "screen capture" in t:
             try:
                 loop = asyncio.get_event_loop()
@@ -816,7 +879,7 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Local Command] screenshot error: {e}")
 
-        # 7. Close window / app
+        # 9. Close window / app
         if t.startswith("close ") or t.startswith("quit ") or t.startswith("exit "):
             target = t.split(" ", 1)[1].strip()
             try:
@@ -864,11 +927,29 @@ class JarvisLive:
                 except Exception as e:
                     print(f"[JARVIS] Failed to send client content: {e}")
 
-            # Fallback to local command execution if Gemini session is not available!
+            # Fallback 1: execute desktop commands locally
             handled = await self._execute_local_voice_command(text)
-            if not handled:
-                self.ui.write_log("SYS: Gemini session connecting, please wait...")
-                self._speak_local("Gemini session is connecting, Sir. Command queued.")
+            if handled:
+                return
+
+            # Fallback 2: Process conversational query via Ollama local LLM!
+            try:
+                from core.llm_client import call_llm_stream
+                self.ui.write_log("SYS: Processing query via local Ollama LLM...")
+                ollama_resp = ""
+                for chunk in call_llm_stream(text, system_prompt="You are JARVIS, an autonomous assistant. Answer Sir concisely in 1-2 sentences in their language."):
+                    ollama_resp += chunk
+                if ollama_resp.strip():
+                    ans = ollama_resp.strip()
+                    self.ui.write_log(f"JARVIS: {ans}")
+                    self._session_log.append(f"JARVIS: {ans}")
+                    self._speak_local(ans)
+                    return
+            except Exception as ollama_err:
+                print(f"[Ollama Fallback] Error: {ollama_err}")
+
+            self.ui.write_log("SYS: Gemini session connecting, please wait...")
+            self._speak_local("Gemini session is connecting, Sir. Command queued.")
 
         asyncio.run_coroutine_threadsafe(_dispatch(), self._loop)
 
