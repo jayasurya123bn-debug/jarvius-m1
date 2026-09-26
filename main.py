@@ -96,8 +96,13 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    if not API_CONFIG_PATH.exists():
+        return ""
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("gemini_api_key", "").strip()
+    except Exception:
+        return ""
 
 
 def _load_system_prompt() -> str:
