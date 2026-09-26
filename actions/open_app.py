@@ -62,6 +62,23 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "steam":              {"Windows": "steam",                   "Darwin": "Steam",                "Linux": "steam"},
     "epic":               {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
     "epic games":         {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
+    "youtube":            {"Windows": "https://www.youtube.com", "Darwin": "https://www.youtube.com", "Linux": "https://www.youtube.com"},
+    # Antigravity IDE Aliases
+    "antigravity":        {"Windows": "antigravity-ide",         "Darwin": "Antigravity",          "Linux": "antigravity"},
+    "antigravity ide":    {"Windows": "antigravity-ide",         "Darwin": "Antigravity",          "Linux": "antigravity"},
+    "antigravity-ide":    {"Windows": "antigravity-ide",         "Darwin": "Antigravity",          "Linux": "antigravity"},
+    "agy":                {"Windows": "antigravity-ide",         "Darwin": "Antigravity",          "Linux": "antigravity"},
+    # Tamil App Aliases
+    "குரோம்":             {"Windows": "chrome",                  "Darwin": "Google Chrome",        "Linux": "google-chrome"},
+    "கூகுள் குரோம்":      {"Windows": "chrome",                  "Darwin": "Google Chrome",        "Linux": "google-chrome"},
+    "யூடியூப்":           {"Windows": "https://www.youtube.com", "Darwin": "https://www.youtube.com", "Linux": "https://www.youtube.com"},
+    "வாட்ஸ்அப்":          {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
+    "நோட்பேட்":           {"Windows": "notepad.exe",             "Darwin": "TextEdit",             "Linux": "gedit"},
+    "கால்குலேட்டர்":       {"Windows": "calc.exe",                "Darwin": "Calculator",           "Linux": "gnome-calculator"},
+    "ஸ்பாட்டிஃபை":        {"Windows": "Spotify",                 "Darwin": "Spotify",              "Linux": "spotify"},
+    "டெர்மினல்":          {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "x-terminal-emulator"},
+    "கேமரா":              {"Windows": "microsoft.windows.camera:", "Darwin": "Photo Booth",       "Linux": "cheese"},
+    "ஆன்டிகிரேவிட்டி":     {"Windows": "antigravity-ide",         "Darwin": "Antigravity",          "Linux": "antigravity"},
 }
 
 
@@ -78,6 +95,36 @@ def _normalize(raw: str) -> str:
     return raw  
 
 def _launch_windows(app_name: str) -> bool:
+    if app_name.startswith("http://") or app_name.startswith("https://"):
+        try:
+            import webbrowser
+            webbrowser.open(app_name)
+            time.sleep(1.0)
+            return True
+        except Exception:
+            pass
+
+    # Antigravity IDE direct detection
+    if app_name.lower() in ("antigravity", "antigravity ide", "antigravity-ide", "agy"):
+        ag_cmd = shutil.which("antigravity-ide")
+        if not ag_cmd:
+            import os
+            from pathlib import Path
+            local_app = os.environ.get("LOCALAPPDATA", "")
+            if local_app:
+                c1 = Path(local_app) / "Programs" / "Antigravity IDE" / "bin" / "antigravity-ide.cmd"
+                c2 = Path(local_app) / "Programs" / "Antigravity IDE" / "Antigravity IDE.exe"
+                if c1.exists():
+                    ag_cmd = str(c1)
+                elif c2.exists():
+                    ag_cmd = str(c2)
+        if ag_cmd:
+            try:
+                subprocess.Popen(f'"{ag_cmd}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(1.2)
+                return True
+            except Exception as e:
+                print(f"[open_app] Antigravity launch failed: {e}")
 
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
@@ -253,7 +300,7 @@ def open_app(
         return f"Unsupported operating system: {_SYSTEM}"
 
     normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    print(f"[open_app] Launching: '{app_name}' -> '{normalized}' ({_SYSTEM})")
 
     if player:
         player.write_log(f"[open_app] {app_name}")
@@ -271,3 +318,303 @@ def open_app(
     except Exception as e:
         print(f"[open_app] Error: {e}")
         return f"Failed to open {app_name}: {e}"
+
+
+def _close_active_window() -> str:
+    try:
+        import pyautogui
+        if _SYSTEM == "Darwin":
+            pyautogui.hotkey("command", "w")
+        else:
+            pyautogui.hotkey("alt", "f4")
+        return "Closed active window, Sir."
+    except Exception as e:
+        return f"Failed to close active window: {e}"
+
+
+def _minimize_active_window() -> str:
+    try:
+        import pyautogui
+        if _SYSTEM == "Darwin":
+            pyautogui.hotkey("command", "m")
+        else:
+            pyautogui.hotkey("win", "down")
+        return "Minimized active window, Sir."
+    except Exception as e:
+        return f"Failed to minimize active window: {e}"
+
+
+def _minimize_all_windows() -> str:
+    try:
+        if _SYSTEM == "Windows":
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "(New-Object -ComObject Shell.Application).MinimizeAll()"],
+                capture_output=True, timeout=5
+            )
+            return "Minimized all windows, Sir."
+        import pyautogui
+        if _SYSTEM == "Darwin":
+            pyautogui.hotkey("command", "option", "h")
+        else:
+            pyautogui.hotkey("ctrl", "alt", "d")
+        return "Minimized all windows, Sir."
+    except Exception as e:
+        return f"Failed to minimize all windows: {e}"
+
+
+def _close_windows_app(raw_name: str, normalized: str) -> bool:
+    """Close a Windows app by name — 4-tier strategy, never fails silently.
+
+    Tier 1: psutil process scan — case-insensitive stem match → taskkill /F /IM
+    Tier 2: PowerShell AppActivate by window title → Alt+F4
+    Tier 3: Get-Process MainWindowTitle fuzzy match → Stop-Process
+    Tier 4: Nuclear taskkill /F /T on any partial match remaining
+    """
+    raw_lower   = raw_name.lower().strip()
+    norm_lower  = normalized.lower().strip()
+    # Build search stems: raw, normalized, both without .exe
+    stems = {
+        raw_lower,
+        norm_lower,
+        raw_lower.replace(".exe", ""),
+        norm_lower.replace(".exe", ""),
+        raw_lower.replace(" ", ""),
+        norm_lower.replace(" ", ""),
+    }
+    # Also add exe variants
+    exe_names = {s + ".exe" if not s.endswith(".exe") else s for s in stems}
+    all_targets = stems | exe_names
+
+    closed = False
+
+    # ── Tier 1: psutil scan + taskkill /F (force, no dialog) ─────────────────
+    if _PSUTIL:
+        killed: list[str] = []
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                pname = (p.info["name"] or "").lower()
+                pname_stem = pname.replace(".exe", "")
+                if any(
+                    pname == t or pname_stem == t.replace(".exe", "") or
+                    t.replace(".exe", "") in pname_stem
+                    for t in all_targets
+                ):
+                    result = subprocess.run(
+                        ["taskkill", "/F", "/T", "/IM", p.info["name"]],
+                        capture_output=True
+                    )
+                    if result.returncode == 0:
+                        killed.append(p.info["name"])
+                        closed = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+                pass
+
+        if closed:
+            time.sleep(0.5)
+            return True
+
+    # ── Tier 2: PowerShell AppActivate → Alt+F4 ───────────────────────────────
+    # Try multiple title variants so it catches "Google Chrome", "chrome", etc.
+    title_variants = [
+        raw_name, normalized,
+        raw_name.replace(".exe", ""), normalized.replace(".exe", ""),
+        raw_name.title(), normalized.title(),
+    ]
+    for title in dict.fromkeys(title_variants):   # deduplicate, preserve order
+        clean = title.replace("'", "").replace('"', "").replace(".exe", "").strip()
+        if not clean:
+            continue
+        ps_script = (
+            f"$ws = New-Object -ComObject WScript.Shell; "
+            f"if ($ws.AppActivate('{clean}')) {{ "
+            f"Start-Sleep -Milliseconds 200; "
+            f"$ws.SendKeys('%{{F4}}'); exit 0 }} exit 1"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True
+        )
+        if res.returncode == 0:
+            time.sleep(0.3)
+            return True
+
+    # ── Tier 3: Get-Process MainWindowTitle fuzzy → Stop-Process ─────────────
+    for stem in {s.replace(".exe", "") for s in stems}:
+        if not stem:
+            continue
+        ps_script = (
+            f"$procs = Get-Process | Where-Object {{ "
+            f"  $_.MainWindowTitle -like '*{stem}*' -or "
+            f"  $_.Name -like '*{stem}*' }}; "
+            f"if ($procs) {{ $procs | Stop-Process -Force; exit 0 }} exit 1"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True
+        )
+        if res.returncode == 0:
+            return True
+
+    # ── Tier 4: Nuclear taskkill /F /T on any remaining partial match ─────────
+    if _PSUTIL:
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                pname = (p.info["name"] or "").lower()
+                if any(s.replace(".exe", "") in pname for s in stems if len(s.replace(".exe", "")) >= 3):
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/IM", p.info["name"]],
+                        capture_output=True
+                    )
+                    closed = True
+            except Exception:
+                pass
+
+    return closed
+
+
+
+
+def _minimize_windows_app(raw_name: str, normalized: str) -> bool:
+    for target in [raw_name, normalized]:
+        clean_target = target.replace("'", "").replace('"', '').replace('.exe', '')
+        ps_script = f"""
+        $ws = New-Object -ComObject WScript.Shell
+        if ($ws.AppActivate('{clean_target}')) {{
+            Start-Sleep -Milliseconds 150
+            $ws.SendKeys('% n')
+            exit 0
+        }}
+        exit 1
+        """
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], capture_output=True)
+        if res.returncode == 0:
+            return True
+
+    # Fallback: if focused, send Win+Down
+    try:
+        import pyautogui
+        pyautogui.hotkey("win", "down")
+        return True
+    except Exception:
+        return False
+
+
+def _close_macos_app(app_name: str) -> bool:
+    try:
+        script = f'tell application "{app_name}" to quit'
+        res = subprocess.run(["osascript", "-e", script], capture_output=True)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _minimize_macos_app(app_name: str) -> bool:
+    try:
+        script = (
+            f'tell application "System Events" to '
+            f'set miniaturized of window 1 of (first process whose name contains "{app_name}") to true'
+        )
+        res = subprocess.run(["osascript", "-e", script], capture_output=True)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _close_linux_app(app_name: str) -> bool:
+    try:
+        res = subprocess.run(["wmctrl", "-c", app_name], capture_output=True)
+        if res.returncode == 0:
+            return True
+        subprocess.run(["pkill", "-f", app_name], capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+def _minimize_linux_app(app_name: str) -> bool:
+    try:
+        res = subprocess.run(["xdotool", "search", "--name", app_name, "windowminimize"], capture_output=True)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def close_app(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+) -> str:
+    """
+    Closes any running application or active window.
+    parameters: {"app_name": "chrome" | "notepad" | "active" | "all" | ...}
+    """
+    app_name = (parameters or {}).get("app_name", "").strip()
+
+    if player:
+        player.write_log(f"[close_app] Closing: '{app_name or 'active window'}'")
+
+    if not app_name or app_name.lower() in ("active", "current", "this", "window", "active window", "current window"):
+        return _close_active_window()
+
+    if app_name.lower() in ("jarvis", "yourself", "this assistant", "jarvis assistant"):
+        if player and hasattr(player, "prompt_close"):
+            player.prompt_close()
+            return "Confirmation requested to close JARVIS, Sir. Please confirm."
+        return "Confirmation requested to close JARVIS, Sir."
+
+    normalized = _normalize(app_name)
+    print(f"[close_app] Closing: '{app_name}' -> '{normalized}' ({_SYSTEM})")
+
+    if _SYSTEM == "Windows":
+        success = _close_windows_app(app_name, normalized)
+    elif _SYSTEM == "Darwin":
+        success = _close_macos_app(app_name) or _close_macos_app(normalized)
+    else:
+        success = _close_linux_app(app_name) or _close_linux_app(normalized)
+
+    if success:
+        return f"Closed {app_name}, Sir."
+    return f"Attempted to close {app_name}, but it may not be currently running, Sir."
+
+
+def minimize_app(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+) -> str:
+    """
+    Minimizes any running application window, active window, or all windows.
+    parameters: {"app_name": "chrome" | "notepad" | "active" | "all" | ...}
+    """
+    app_name = (parameters or {}).get("app_name", "").strip()
+
+    if player:
+        player.write_log(f"[minimize_app] Minimizing: '{app_name or 'active window'}'")
+
+    if app_name.lower() in ("jarvis", "yourself", "this assistant", "jarvis assistant"):
+        if player and hasattr(player, "minimize"):
+            player.minimize()
+            return "JARVIS window minimized, Sir."
+        return "JARVIS window minimized, Sir."
+
+    if app_name.lower() in ("all", "all windows", "all apps", "desktop", "everything"):
+        return _minimize_all_windows()
+
+    if not app_name or app_name.lower() in ("active", "current", "this", "window", "active window", "current window"):
+        return _minimize_active_window()
+
+    normalized = _normalize(app_name)
+    print(f"[minimize_app] Minimizing: '{app_name}' -> '{normalized}' ({_SYSTEM})")
+
+    if _SYSTEM == "Windows":
+        success = _minimize_windows_app(app_name, normalized)
+    elif _SYSTEM == "Darwin":
+        success = _minimize_macos_app(app_name) or _minimize_macos_app(normalized)
+    else:
+        success = _minimize_linux_app(app_name) or _minimize_linux_app(normalized)
+
+    if success:
+        return f"Minimized {app_name}, Sir."
+    return f"Attempted to minimize {app_name}, Sir."

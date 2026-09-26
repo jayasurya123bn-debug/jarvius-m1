@@ -77,28 +77,63 @@ def _compress_silence(
     return np.concatenate(out) if out else arr
 
 
-TTS_OUTPUT_DEVICE = None
+def get_preferred_output_device() -> int | None:
+    """Find the best output device index, prioritizing connected Bluetooth headphones, then system default."""
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d.get("max_output_channels", 0) > 0:
+                name = d.get("name", "").lower()
+                api = sd.query_hostapis(d.get("hostapi", 0)).get("name", "").lower()
+                if "wdm-ks" in api:
+                    continue
+                if any(k in name for k in ("headphones", "headset", "p47", "m19", "bluetooth", "airbass", "zyio", "boult")):
+                    return i
+        d_out = sd.default.device[1]
+        if d_out is not None and d_out >= 0:
+            return int(d_out)
+    except Exception:
+        pass
+    return None
+
+
+TTS_OUTPUT_DEVICE = get_preferred_output_device()
+
 
 def _play_np(samples, sample_rate: int) -> None:
     """Play float32 mono (or stereo) audio via sounddevice.
     Accepts numpy arrays or PyTorch tensors.
     """
     global TTS_OUTPUT_DEVICE
-    sd.play(_to_numpy(samples), sample_rate, device=TTS_OUTPUT_DEVICE)
+    out_dev = TTS_OUTPUT_DEVICE if TTS_OUTPUT_DEVICE is not None else get_preferred_output_device()
+    sd.play(_to_numpy(samples), sample_rate, device=out_dev)
     sd.wait()
 
 
 def _play_audio_bytes(audio_bytes: bytes) -> None:
-    """Decode MP3/WAV/OGG bytes and play via sounddevice (uses miniaudio)."""
+    """Decode MP3/WAV/OGG bytes and play via sounddevice (uses miniaudio).
+
+    Guards against empty or corrupt audio so a network hiccup never
+    causes a silent gap — it raises clearly instead of playing nothing.
+    """
+    if not audio_bytes or len(audio_bytes) < 128:
+        raise ValueError(f"[TTS] Audio bytes too short ({len(audio_bytes) if audio_bytes else 0} bytes) — skipping playback")
     import miniaudio
     global TTS_OUTPUT_DEVICE
-    decoded = miniaudio.decode(
-        audio_bytes,
-        output_format=miniaudio.SampleFormat.FLOAT32,
-        nchannels=1,
-    )
+    try:
+        decoded = miniaudio.decode(
+            audio_bytes,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+        )
+    except Exception as e:
+        raise ValueError(f"[TTS] miniaudio decode failed: {e}") from e
     samples = np.array(decoded.samples, dtype=np.float32)
-    sd.play(samples, decoded.sample_rate, device=TTS_OUTPUT_DEVICE)
+    if samples.size == 0:
+        raise ValueError("[TTS] Decoded audio is empty — skipping playback")
+    out_dev = TTS_OUTPUT_DEVICE if TTS_OUTPUT_DEVICE is not None else get_preferred_output_device()
+    sd.play(samples, decoded.sample_rate, device=out_dev)
     sd.wait()
 
 
@@ -107,23 +142,57 @@ def _play_audio_bytes(audio_bytes: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 class EdgeTTSEngine:
-    """Microsoft EdgeTTS – free, requires internet."""
+    """Microsoft EdgeTTS – free, requires internet. Supports automatic Tamil & English voices.
 
-    def __init__(self, voice: str = "en-US-GuyNeural"):
-        self.voice = voice
+    Silent-gap fixes:
+    - Retry up to MAX_RETRIES times on network errors.
+    - Per-attempt asyncio timeout so a hung stream never causes indefinite silence.
+    - Falls back to pyttsx3 offline TTS if all retries fail.
+    """
+    MAX_RETRIES   = 3
+    SYNTH_TIMEOUT = 15   # seconds per attempt
+
+    def __init__(self, voice: str = "en-US-GuyNeural", tamil_voice: str = "ta-IN-ValluvarNeural", rate: str = "+20%"):
+        self.voice       = voice
+        self.tamil_voice = tamil_voice
+        self.rate        = rate
 
     def speak(self, text: str) -> None:
-        loop = asyncio.new_event_loop()
-        try:
-            audio_bytes = loop.run_until_complete(self._synth(text))
-        finally:
-            loop.close()
-        if audio_bytes:
-            _play_audio_bytes(audio_bytes)
+        import re
+        has_tamil = bool(re.search(r"[\u0B80-\u0BFF]", text))
+        voice     = self.tamil_voice if has_tamil else self.voice
 
-    async def _synth(self, text: str) -> bytes:
+        last_err: Exception | None = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    audio_bytes = loop.run_until_complete(
+                        asyncio.wait_for(self._synth(text, voice), timeout=self.SYNTH_TIMEOUT)
+                    )
+                finally:
+                    loop.close()
+
+                if audio_bytes and len(audio_bytes) >= 128:
+                    _play_audio_bytes(audio_bytes)
+                    return   # success
+
+                raise ValueError(f"EdgeTTS returned empty audio (attempt {attempt})")
+
+            except Exception as e:
+                last_err = e
+                print(f"[TTS] EdgeTTS attempt {attempt}/{self.MAX_RETRIES} failed: {e}")
+                if attempt < self.MAX_RETRIES:
+                    import time as _t
+                    _t.sleep(1.5)
+
+        # All retries exhausted — fall back to offline pyttsx3
+        print(f"[TTS] EdgeTTS failed after {self.MAX_RETRIES} attempts — using pyttsx3 fallback")
+        _pyttsx3_speak(text)
+
+    async def _synth(self, text: str, voice: str) -> bytes:
         import edge_tts
-        comm = edge_tts.Communicate(text, self.voice)
+        comm = edge_tts.Communicate(text, voice, rate=self.rate)
         buf  = bytearray()
         async for chunk in comm.stream():
             if chunk["type"] == "audio":
@@ -384,10 +453,38 @@ class ElevenLabsTTSEngine:
 # Thread-safe player wrapper
 # ---------------------------------------------------------------------------
 
+def _pyttsx3_speak(text: str) -> None:
+    """Emergency offline fallback using pyttsx3 — always available, no internet."""
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        try:
+            import win32com.client
+            spk = win32com.client.Dispatch("SAPI.SpVoice")
+            outputs = spk.GetAudioOutputs()
+            for i in range(outputs.Count):
+                desc = outputs.Item(i).GetDescription().lower()
+                if any(k in desc for k in ("headphones", "headset", "p47", "m19", "bluetooth")):
+                    spk.AudioOutput = outputs.Item(i)
+                    break
+        except Exception:
+            pass
+        engine.setProperty("rate", 205)
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+    except Exception as e:
+        print(f"[TTS] pyttsx3 fallback also failed: {e}")
+
+
 class TTSPlayer:
     """
     Wraps any *Engine. Exposes a blocking speak() method
     meant to be called from a dedicated background thread.
+
+    Silent-gap fix: if the primary engine raises ANY exception,
+    we fall back to pyttsx3 so the user always hears SOMETHING
+    instead of a silent gap.
     """
 
     def __init__(self, engine):
@@ -405,15 +502,25 @@ class TTSPlayer:
         on_start: Optional[Callable] = None,
         on_done:  Optional[Callable] = None,
     ) -> None:
-        """Synthesise and play text. BLOCKING – call from a dedicated thread."""
+        """Synthesise and play text. BLOCKING – call from a dedicated thread.
+
+        On any engine failure: logs the error clearly and falls back to
+        pyttsx3 so there is never a silent gap.
+        """
+        with self._lock:
+            self._playing = True
         try:
-            with self._lock:
-                self._playing = True
             if on_start:
                 on_start()
             self._engine.speak(text)
         except Exception as e:
-            print(f"[TTS] Error: {e}")
+            # Primary engine failed — log clearly and use pyttsx3 fallback
+            print(f"[TTS] Primary engine error ({type(e).__name__}): {e}")
+            print("[TTS] Falling back to pyttsx3 offline engine...")
+            try:
+                _pyttsx3_speak(text)
+            except Exception as fe:
+                print(f"[TTS] pyttsx3 fallback failed too: {fe}")
         finally:
             with self._lock:
                 self._playing = False
@@ -442,5 +549,6 @@ def create_tts_player(config: dict) -> TTSPlayer:
         engine   = ElevenLabsTTSEngine(api_key=api_key, voice_id=voice_id)
     else:   # edgetts (default)
         voice  = config.get("tts_voice", "en-US-GuyNeural")
-        engine = EdgeTTSEngine(voice=voice)
+        rate   = config.get("tts_rate", "+20%")
+        engine = EdgeTTSEngine(voice=voice, rate=rate)
     return TTSPlayer(engine)

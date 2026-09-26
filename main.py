@@ -52,15 +52,16 @@ from memory.memory_manager import (
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
-from actions.open_app          import open_app
+from actions.open_app          import open_app, close_app, minimize_app
 from actions.weather_report    import weather_action
-from actions.send_message      import send_message
+from actions.send_message      import send_message, parse_whatsapp_voice_command
 from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
 from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
 from actions.browser_control   import browser_control
+from actions.auto_answer       import auto_answer
 from actions.file_controller   import file_controller
 from actions.code_helper       import code_helper
 from actions.dev_agent         import dev_agent
@@ -136,6 +137,42 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "close_app",
+        "description": (
+            "Closes ANY running application or window on the computer by name, or closes the active app or all apps. "
+            "Use whenever the user asks to close, quit, kill, or terminate any application "
+            "(e.g. 'close Chrome', 'close Notepad', 'close Spotify', 'close WhatsApp', 'close active window', 'close all apps')."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "app_name": {
+                    "type": "STRING",
+                    "description": "Name of the application to close (e.g. 'Chrome', 'Notepad', 'Spotify', 'active', or 'all')"
+                }
+            },
+            "required": ["app_name"]
+        }
+    },
+    {
+        "name": "minimize_app",
+        "description": (
+            "Minimizes ANY running application window on the computer by name, or minimizes all windows or the active app. "
+            "Use whenever the user asks to minimize any application or window "
+            "(e.g. 'minimize Chrome', 'minimize Notepad', 'minimize Spotify', 'minimize all windows', 'minimize current window')."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "app_name": {
+                    "type": "STRING",
+                    "description": "Name of the application to minimize (e.g. 'Chrome', 'Notepad', 'all', or 'active')"
+                }
+            },
+            "required": []
+        }
+    },
+    {
         "name": "web_search",
         "description": (
             "Searches the web. Use for ANY question about current facts, events, prices, "
@@ -180,12 +217,12 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "send_message",
-        "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
+        "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform. 'receiver' must always be the clean English recipient contact name (e.g. 'Arun', 'Rahul', 'Amma') stripped of Tamil/Tanglish suffixes like '-ku', 'kitta'. 'message_text' must preserve the exact Tanglish, Tamil, or English phrasing as requested by Sir.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "receiver":     {"type": "STRING", "description": "Recipient contact name"},
-                "message_text": {"type": "STRING", "description": "The message to send"},
+                "receiver":     {"type": "STRING", "description": "Recipient contact name in clean English for search (e.g. 'Arun', 'Rahul', 'Mom')"},
+                "message_text": {"type": "STRING", "description": "The exact message to send in Tanglish, Tamil, or English"},
                 "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
             },
             "required": ["receiver", "message_text", "platform"]
@@ -207,17 +244,36 @@ TOOL_DECLARATIONS = [
     {
         "name": "youtube_video",
         "description": (
-            "Controls YouTube. Use for: playing videos, summarizing a video's content, "
-            "getting video info, or showing trending videos."
+            "Controls YouTube. Use for: playing videos, skipping to the next song/video (using Shift + N shortcut), "
+            "summarizing a video's content, getting video info, or showing trending videos."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "play | summarize | get_info | trending (default: play)"},
+                "action": {"type": "STRING", "description": "play | next | summarize | get_info | trending (default: play). Use 'next' to play the next song/video via Shift + N shortcut"},
                 "query":  {"type": "STRING", "description": "Search query for play action"},
                 "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
                 "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
                 "url":    {"type": "STRING", "description": "Video URL for get_info action"},
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "auto_answer",
+        "description": (
+            "Autonomous auto-answer and form/quiz solver using Playwright. "
+            "Scans web page or quiz for questions, finds best answers from local scratchpad or web, "
+            "fills inputs, dropdowns, radios, checkboxes, captures verification screenshots, "
+            "and requests explicit permission before submitting."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "url": {"type": "STRING", "description": "Target webpage or form URL (optional, defaults to current active page)"},
+                "action": {"type": "STRING", "description": "auto_answer | scan | submit"},
+                "answers": {"type": "OBJECT", "description": "Optional mapping of field names/questions to specific custom answers"},
+                "allow_submit": {"type": "BOOLEAN", "description": "True only if user explicitly allowed form submission"}
             },
             "required": []
         }
@@ -459,9 +515,20 @@ TOOL_DECLARATIONS = [
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
+            "Call this ONLY after the user has explicitly confirmed they want to close or shut down Jarvis "
+            "(e.g., when asked for confirmation, user replies yes, close it, confirm, proceed, goodbye). "
             "The user can say this in ANY language."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+        }
+    },
+    {
+        "name": "minimize_jarvis",
+        "description": (
+            "Minimizes the Jarvis application window to the taskbar. "
+            "Call this when the user asks to minimize Jarvis, hide the window, minimize screen, etc."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -671,18 +738,33 @@ class JarvisLive:
             with self._tts_lock:
                 try:
                     self.set_speaking(True)
-                    import re
-                    has_tamil = bool(re.search(r"[\u0B80-\u0BFF]", text))
-                    if has_tamil:
-                        try:
-                            from core.tts import EdgeTTSEngine
-                            EdgeTTSEngine(tamil_voice="ta-IN-ValluvarNeural").speak(text)
-                            return
-                        except Exception:
-                            pass
+                    # Try neural EdgeTTS first: high quality, streams directly to Bluetooth/default output via sounddevice
+                    try:
+                        from core.tts import EdgeTTSEngine
+                        engine = EdgeTTSEngine(
+                            voice="en-IN-PrabhatNeural",
+                            tamil_voice="ta-IN-ValluvarNeural",
+                            rate="+20%"
+                        )
+                        engine.speak(text)
+                        return
+                    except Exception as edge_err:
+                        print(f"[TTS Local] EdgeTTS failed: {edge_err}, falling back to pyttsx3")
+
                     import pyttsx3
                     engine = pyttsx3.init()
-                    engine.setProperty("rate", 185)
+                    try:
+                        import win32com.client
+                        spk = win32com.client.Dispatch("SAPI.SpVoice")
+                        outputs = spk.GetAudioOutputs()
+                        for i in range(outputs.Count):
+                            desc = outputs.Item(i).GetDescription().lower()
+                            if any(k in desc for k in ("headphones", "headset", "p47", "bluetooth")):
+                                spk.AudioOutput = outputs.Item(i)
+                                break
+                    except Exception:
+                        pass
+                    engine.setProperty("rate", 205)
                     engine.say(text)
                     engine.runAndWait()
                 except Exception as e:
@@ -692,12 +774,15 @@ class JarvisLive:
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _on_wake_detected(self, matched_phrase: str, has_command: bool = False):
+    def _on_wake_detected(self, matched_phrase: str, has_command: bool = False, full_text: str = ""):
         """Called when 'Hey Jarvis' / 'Jarvis' / 'Hey Jarvius' is detected."""
         print(f"[JARVIS] ⚡ Wake word detected: '{matched_phrase}' (has_command={has_command})")
         self.ui.set_state("LISTENING")
         self.ui.set_voice_status("SIR", "Sir", 1.0)
         self.ui.write_log(f"SYS: ⚡ Wake word detected: '{matched_phrase}'.")
+
+        disp = (full_text or matched_phrase).strip()
+        self.ui.set_input_text(disp)
 
         if self._dashboard and self._loop:
             try:
@@ -705,6 +790,7 @@ class JarvisLive:
                     self._dashboard.broadcast({
                         "type": "wake",
                         "wake_word": matched_phrase,
+                        "text": disp,
                         "ts": datetime.now().isoformat(),
                     }),
                     self._loop
@@ -714,6 +800,9 @@ class JarvisLive:
 
         if not has_command:
             # User said "Hey Jarvis" alone -> acknowledge immediately!
+            self.ui.write_log(f"Sir: {disp}")
+            self._session_log.append(f"Sir: {disp}")
+
             greetings = [
                 "Yes Sir?",
                 "At your service, Sir.",
@@ -732,8 +821,8 @@ class JarvisLive:
         """Execute common desktop and system commands locally without requiring Gemini Live."""
         t = text.lower().strip().rstrip(".!?")
 
-        # 1. Tamil Greetings & Common Phrases
-        if any(k in t for k in ("வணக்கம்", "vanakkam", "வாழ்க வளமுடன்")):
+        # 1. Tamil Greetings, Status & Common Phrases
+        if any(k in t for k in ("வணக்கம்", "vanakkam", "வாழ்க வளமுடன்", "ஹலோ", "ஹாய்", "hello jarvis", "hi jarvis")):
             msg = "வணக்கம் சார்! நான் நலமாக இருக்கிறேன், சொல்லுங்கள் உங்களுக்கு என்ன உதவி வேண்டும்?"
             self.ui.write_log(f"JARVIS: {msg}")
             self._speak_local(msg)
@@ -745,15 +834,27 @@ class JarvisLive:
             self._speak_local(msg)
             return True
 
-        # 2. App opening (English & Tamil/Tanglish: "open chrome", "chrome open pannu", "youtube open")
+        if any(k in t for k in ("என்ன பண்ற", "என்ன செய்கிறாய்", "enna panra", "enna seira", "what are you doing")):
+            msg = "நான் உங்கள் கட்டளைகளுக்காக காத்திருக்கிறேன் சார். என்ன செய்ய வேண்டும் சொல்லுங்கள்!"
+            self.ui.write_log(f"JARVIS: {msg}")
+            self._speak_local(msg)
+            return True
+
+        # 2. App opening (English & Tamil/Tanglish: "open chrome", "chrome open pannu", "youtube open", "குரோம் ஓபன் பண்ணு", "யூடியூப் திற")
         app_name = None
-        if t.startswith("open ") or t.startswith("launch ") or t.startswith("start "):
-            raw = t.split(" ", 1)[1].strip()
-            app_name = re.sub(r"^(the|app|application)\s+", "", raw).strip()
+        # Pattern A: Prefix command: "open chrome", "திற குரோம்", "ஓபன் யூடியூப்", "launch whatsapp"
+        m_pfx = re.match(r"^(?:open|launch|start|run|ஓபன்|ஓப்பன்|திற|லான்ச்)\s+(?:the\s+|app\s+|application\s+)?(.+?)(?:\s+pannu|\s+pannunga|\s+பண்ணு|\s+பண்ணுங்க|\s+செய்|\s+செய்யவும்|\s+திறக்கவும்)?$", t)
+        if m_pfx:
+            app_name = m_pfx.group(1).strip()
         else:
-            m_rev = re.search(r"^(.+?)\s+(?:open|launch|start)(?:\s+pannu|\s+pannunga|\s+பண்ணு)?$", t)
+            # Pattern B: Suffix command: "chrome open pannu", "யூடியூப் ஓபன் பண்ணு", "youtube open", "குரோம் திற"
+            m_rev = re.search(r"^(.+?)\s+(?:open|launch|start|ஓபன்|ஓப்பன்|திற|லான்ச்)(?:\s+pannu|\s+pannunga|\s+பண்ணு|\s+பண்ணுங்க|\s+செய்|\s+செய்யவும்|\s+திறக்கவும்)?$", t)
             if m_rev:
                 app_name = m_rev.group(1).strip()
+            else:
+                m_rev2 = re.search(r"^(.+?)\s+(?:திறக்கவும்|open\s+pannu|open\s+pannunga|திற|open)$", t)
+                if m_rev2:
+                    app_name = m_rev2.group(1).strip()
 
         if app_name:
             self.ui.write_log(f"SYS: Executing local open_app: '{app_name}'")
@@ -768,23 +869,142 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Local Command] open_app error: {e}")
 
-        # 3. Spotify and media controls
-        if any(k in t for k in ("spotify", "music", "song", "track")):
+        # Close App Command: "close chrome", "chrome close pannu", "மூடு குரோம்", "குரோம் மூடு", "close notepad"
+        close_target = None
+        m_c_pfx = re.match(r"^(?:close|quit|kill|exit|terminate|க்ளோஸ்|மூடு)\s+(?:the\s+|app\s+|application\s+)?(.+?)(?:\s+pannu|\s+pannunga|\s+பண்ணு|\s+பண்ணுங்க|\s+செய்|\s+செய்யவும்|\s+மூடவும்)?$", t)
+        if m_c_pfx:
+            close_target = m_c_pfx.group(1).strip()
+        else:
+            m_c_sfx = re.search(r"^(.+?)\s+(?:close|quit|kill|exit|க்ளோஸ்|மூடு)(?:\s+pannu|\s+pannunga|\s+பண்ணு|\s+பண்ணுங்க|\s+செய்|\s+செய்யவும்|\s+மூடவும்)?$", t)
+            if m_c_sfx:
+                close_target = m_c_sfx.group(1).strip()
+
+        if (
+            t in ("close", "close it", "close jarvis", "close app", "close application", "shutdown", "shut down", "exit", "quit", "bye", "மூடு", "க்ளோஸ்", "க்ளோஸ் பண்ணு", "ஜார்விஸ் மூடு")
+            or (close_target and close_target in ("jarvis", "yourself", "this conversation", "this app", "this application", "jarvis assistant"))
+        ):
+            self.ui.prompt_close()
+            msg = "Are you sure you want to close JARVIS, Sir? Please confirm."
+            self.ui.write_log(f"JARVIS: {msg}")
+            self._speak_local(msg)
+            return True
+
+        if close_target:
+            self.ui.write_log(f"SYS: Executing local close_app: '{close_target}'")
+            try:
+                loop = asyncio.get_event_loop()
+                from actions.open_app import close_app
+                res = await loop.run_in_executor(None, lambda: close_app({"app_name": close_target}, None, self.ui))
+                msg = res or f"Closed {close_target}, Sir."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return True
+            except Exception as e:
+                print(f"[Local Command] close_app error: {e}")
+
+        # Minimize App Command: "minimize chrome", "chrome minimize pannu", "மினிமைஸ் குரோம்", "minimize all"
+        min_target = None
+        if t in ("minimize all", "minimize everything", "show desktop", "மினிமைஸ் ஆல்"):
+            min_target = "all"
+        else:
+            m_m_pfx = re.match(r"^(?:minimize|hide|மினிமைஸ்)\s+(?:the\s+|app\s+|application\s+)?(.+?)(?:\s+pannu|\s+pannunga|\s+பண்ணு|\s+பண்ணுங்க)?$", t)
+            if m_m_pfx:
+                min_target = m_m_pfx.group(1).strip()
+            else:
+                m_m_sfx = re.search(r"^(.+?)\s+(?:minimize|hide|மினிமைஸ்)(?:\s+pannu|\s+pannunga|\s+பண்ணு|\s+பண்ணுங்க)?$", t)
+                if m_m_sfx:
+                    min_target = m_m_sfx.group(1).strip()
+
+        if (
+            t in ("minimize", "minimize it", "minimize jarvis", "hide", "hide jarvis", "hide window", "மினிமைஸ்")
+            or (min_target and min_target in ("jarvis", "yourself", "this conversation", "this app", "this window", "jarvis assistant"))
+        ):
+            self.ui.minimize()
+            msg = "Minimizing window, Sir."
+            self.ui.write_log(f"SYS: {msg}")
+            self._speak_local(msg)
+            return True
+
+        if min_target:
+            self.ui.write_log(f"SYS: Executing local minimize_app: '{min_target}'")
+            try:
+                loop = asyncio.get_event_loop()
+                from actions.open_app import minimize_app
+                res = await loop.run_in_executor(None, lambda: minimize_app({"app_name": min_target}, None, self.ui))
+                msg = res or f"Minimized {min_target}, Sir."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return True
+            except Exception as e:
+                print(f"[Local Command] minimize_app error: {e}")
+
+        # 3. WhatsApp Messaging (English contact search + Tanglish/Tamil message)
+        wa_contact, wa_msg = parse_whatsapp_voice_command(text)
+        if wa_contact and wa_msg:
+            self.ui.write_log(f"SYS: Dispatching local WhatsApp message to '{wa_contact}': '{wa_msg}'")
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: send_message(
+                        parameters={"platform": "whatsapp", "receiver": wa_contact, "message_text": wa_msg},
+                        response=None,
+                        player=self.ui,
+                        session_memory=None,
+                    )
+                )
+                ack = f"WhatsApp-la {wa_contact}-ku '{wa_msg}' nu message anupitten, Sir!"
+                self.ui.write_log(f"JARVIS: {ack}")
+                self._speak_local(ack)
+                return True
+            except Exception as e:
+                print(f"[Local Command] WhatsApp send error: {e}")
+
+        # YouTube Next Song Command (Shift + N shortcut): "youtube play next", "youtube next song", "youtube la playnext song"
+        if ("youtube" in t or "யூடியூப்" in t) and any(k in t for k in ("next", "play next", "playnext", "skip", "அடுத்த", "அடுத்த பாடல்", "அடுத்த பாட்டு")):
+            self.ui.write_log("SYS: Dispatching YouTube Next Song (Shift + N)")
+            try:
+                loop = asyncio.get_event_loop()
+                from actions.youtube_video import youtube_video
+                res = await loop.run_in_executor(None, lambda: youtube_video({"action": "next"}, None, self.ui, None, self.speak))
+                msg = res or "Skipped to next YouTube song (Shift + N), Sir."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return True
+            except Exception as e:
+                print(f"[Local Command] YouTube next song error: {e}")
+
+        # Auto-Answer / Quiz & Form filling voice command
+        if any(k in t for k in ("auto answer", "answer quiz", "fill form", "form fill", "quiz answer", "பதில் சொல்லு", "குவிஸ்", "படிவம் நிரப்பு")):
+            self.ui.write_log(f"SYS: Dispatching auto_answer for command: '{text}'")
+            try:
+                loop = asyncio.get_event_loop()
+                from actions.auto_answer import auto_answer
+                res = await loop.run_in_executor(None, lambda: auto_answer({"action": "auto_answer"}, self.ui, self.speak))
+                msg = res or "Auto-answer workflow executed, Sir."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return True
+            except Exception as e:
+                print(f"[Local Command] auto_answer error: {e}")
+
+        # 4. Spotify and media controls
+        if any(k in t for k in ("spotify", "music", "song", "track", "பாடல்", "பாட்டு", "இசை", "மியூசிக்")):
             try:
                 loop = asyncio.get_event_loop()
                 from actions.desktop import desktop_control
-                if "next" in t or "skip" in t:
+                if any(k in t for k in ("next", "skip", "அடுத்த பாடல்", "மாற்று")):
                     await loop.run_in_executor(None, lambda: desktop_control({"action": "media_next"}, self.ui))
                     msg = "Skipped to next track, Sir."
-                elif "previous" in t or "back" in t:
+                elif any(k in t for k in ("previous", "back", "முந்தைய பாடல்")):
                     await loop.run_in_executor(None, lambda: desktop_control({"action": "media_prev"}, self.ui))
                     msg = "Playing previous track, Sir."
-                elif "pause" in t or "stop" in t:
+                elif any(k in t for k in ("pause", "stop", "நிறுத்து", "பாஸ்")):
                     await loop.run_in_executor(None, lambda: desktop_control({"action": "media_play_pause"}, self.ui))
                     msg = "Music paused, Sir."
-                elif "play" in t or "resume" in t:
-                    match = re.search(r"play\s+(.+?)(?:\s+on\s+spotify)?$", t)
-                    if match and match.group(1).strip() not in ("music", "song", ""):
+                elif any(k in t for k in ("play", "resume", "போடு", "ப்ளே")):
+                    match = re.search(r"(?:play|போடு)\s+(.+?)(?:\s+on\s+spotify|\s+பாடல்)?$", t)
+                    if match and match.group(1).strip() not in ("music", "song", "பாட்டு", "பாடல்", ""):
                         query = match.group(1).strip()
                         from actions.open_app import open_app
                         await loop.run_in_executor(None, lambda: open_app({"app_name": "spotify"}, None, self.ui))
@@ -803,16 +1023,16 @@ class JarvisLive:
                 print(f"[Local Command] spotify error: {e}")
 
         # 4. Volume and audio controls
-        if any(k in t for k in ("volume", "mute", "unmute", "sound")):
+        if any(k in t for k in ("volume", "mute", "unmute", "sound", "சத்தம்", "வால்யூம்")):
             act = "toggle_mute"
             val = None
-            if "mute" in t and "unmute" not in t:
+            if ("mute" in t and "unmute" not in t) or "அமைதி" in t or "மியூட்" in t:
                 act = "mute"
-            elif "unmute" in t:
+            elif "unmute" in t or "அன்மியூட்" in t:
                 act = "unmute"
-            elif "up" in t or "increase" in t or "higher" in t:
+            elif any(k in t for k in ("up", "increase", "higher", "அதிகரி", "கூட்டு", "ஏத்து")):
                 act = "volume_up"
-            elif "down" in t or "decrease" in t or "lower" in t:
+            elif any(k in t for k in ("down", "decrease", "lower", "குறை", "இறக்கு")):
                 act = "volume_down"
             elif "max" in t or "100" in t:
                 act = "set_volume"
@@ -836,17 +1056,23 @@ class JarvisLive:
                 print(f"[Local Command] volume error: {e}")
 
         # 5. Time query
-        if any(k in t for k in ("what time", "what's the time", "current time", "tell me the time", "time now", "what is the time", "மணி என்ன")):
+        if any(k in t for k in ("what time", "what's the time", "current time", "tell me the time", "time now", "what is the time", "time enna", "மணி என்ன", "நேரம் என்ன")):
             time_now = datetime.now().strftime("%I:%M %p")
-            msg = f"It is currently {time_now}, Sir."
+            if bool(re.search(r"[\u0B80-\u0BFF]", t)):
+                msg = f"இப்போது நேரம் {time_now} சார்."
+            else:
+                msg = f"It is currently {time_now}, Sir."
             self.ui.write_log(f"JARVIS: {msg}")
             self._speak_local(msg)
             return True
 
         # 6. Date query
-        if any(k in t for k in ("what date", "today's date", "what is the date", "what's today's date", "which day is today", "இன்று என்ன தேதி")):
+        if any(k in t for k in ("what date", "today's date", "what is the date", "what's today's date", "which day is today", "date enna", "இன்று என்ன தேதி", "இன்னைக்கு என்ன தேதி")):
             date_now = datetime.now().strftime("%A, %B %d, %Y")
-            msg = f"Today is {date_now}, Sir."
+            if bool(re.search(r"[\u0B80-\u0BFF]", t)):
+                msg = f"இன்று {date_now} சார்."
+            else:
+                msg = f"Today is {date_now}, Sir."
             self.ui.write_log(f"JARVIS: {msg}")
             self._speak_local(msg)
             return True
@@ -882,10 +1108,16 @@ class JarvisLive:
         # 9. Close window / app
         if t.startswith("close ") or t.startswith("quit ") or t.startswith("exit "):
             target = t.split(" ", 1)[1].strip()
+            if target in ("jarvis", "yourself", "this app", "this window", "this application", "jarvis assistant"):
+                self.ui.prompt_close()
+                msg = "Are you sure you want to close JARVIS, Sir? Please confirm."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return True
             try:
                 loop = asyncio.get_event_loop()
-                from actions.computer_settings import computer_settings
-                res = await loop.run_in_executor(None, lambda: computer_settings({"action": "close", "target": target}, None, self.ui))
+                from actions.open_app import close_app
+                res = await loop.run_in_executor(None, lambda: close_app({"app_name": target}, None, self.ui))
                 msg = res or f"Closed {target}, Sir."
                 self.ui.write_log(f"JARVIS: {msg}")
                 self._speak_local(msg)
@@ -900,7 +1132,79 @@ class JarvisLive:
             return
 
         async def _dispatch():
-            # Check if Gemini Live session is connected
+            raw = (text or "").strip()
+            if not raw:
+                return
+            t = raw.lower().rstrip(".!?")
+
+            # Check 1: If confirmation overlay is active, process user confirmation reply immediately
+            if self.ui and self.ui.is_confirm_close_visible():
+                affirmative = (
+                    "yes", "y", "close", "close it", "close jarvis", "confirm", "ok", "okay",
+                    "proceed", "shut down", "shutdown", "exit", "quit", "bye", "yes please",
+                    "sure", "do it", "ஆம்", "சரி", "க்ளோஸ்", "க்ளோஸ் பண்ணு", "மூடு",
+                    "ஆமா", "ஆமாம்", "sari", "aama", "aamam", "confirm close",
+                )
+                negative = (
+                    "no", "n", "cancel", "stop", "abort", "stay", "back", "dont", "don't",
+                    "dont close", "don't close", "never mind", "wait", "வேண்டாம்",
+                    "இல்லை", "இல்ல", "vendam", "illai", "cancel close",
+                )
+                if any(t == a or t.startswith(a + " ") for a in affirmative):
+                    self.ui.confirm_close()
+                    return
+                elif any(t == n or t.startswith(n + " ") for n in negative):
+                    self.ui.cancel_close()
+                    return
+
+            # Check 2: Direct voice/text close command for JARVIS
+            close_jarvis_terms = (
+                "close", "close it", "close jarvis", "close app", "close application",
+                "close window", "close this", "close this window", "shutdown", "shut down",
+                "shutdown jarvis", "shut down jarvis", "exit", "exit jarvis", "quit", "quit jarvis",
+                "bye", "bye jarvis", "goodbye", "goodbye jarvis", "i close", "close tell", "tell close",
+                "மூடு", "க்ளோஸ்", "க்ளோஸ் பண்ணு", "ஜார்விஸ் மூடு", "ஜார்விஸ் க்ளோஸ் பண்ணு",
+                "moodu", "close pannu", "jarvis moodu", "jarvis close",
+            )
+            is_close_cmd = (
+                t in close_jarvis_terms
+                or t.startswith("close jarvis")
+                or t.startswith("shutdown jarvis")
+                or t.startswith("exit jarvis")
+                or bool(re.search(r"^(?:jarvis\s+)?(?:close|shut\s*down|exit|quit|க்ளோஸ்|மூடு)(?:\s+(?:jarvis|yourself|app|application|window|it|please|pannu|பண்ணு))?$", t))
+                or t in ("i close", "close tell", "tell close")
+            )
+            if is_close_cmd:
+                self.ui.prompt_close()
+                msg = "Are you sure you want to close JARVIS, Sir? Please confirm."
+                self.ui.write_log(f"JARVIS: {msg}")
+                self._speak_local(msg)
+                return
+
+            # Check 3: Direct voice/text minimize command for JARVIS
+            min_jarvis_terms = (
+                "minimize", "minimize it", "minimize jarvis", "hide", "hide jarvis",
+                "hide window", "minimize window", "minimize this", "மினிமைஸ்",
+                "minimize pannu", "மினிமைஸ் பண்ணு",
+            )
+            is_min_cmd = (
+                t in min_jarvis_terms
+                or t.startswith("minimize jarvis")
+                or bool(re.search(r"^(?:jarvis\s+)?(?:minimize|hide|மினிமைஸ்)(?:\s+(?:jarvis|yourself|app|application|window|it|please|pannu|பண்ணு))?$", t))
+            )
+            if is_min_cmd:
+                self.ui.minimize()
+                msg = "Minimizing window, Sir."
+                self.ui.write_log(f"SYS: {msg}")
+                self._speak_local(msg)
+                return
+
+            # Check 4: Fast-path local system & app commands (open app, close app, time, date, screenshot, spotify)
+            handled = await self._execute_local_voice_command(raw)
+            if handled:
+                return
+
+            # Forward to Gemini Live session if connected
             if self.session:
                 try:
                     await self.session.send_client_content(
@@ -927,26 +1231,28 @@ class JarvisLive:
                 except Exception as e:
                     print(f"[JARVIS] Failed to send client content: {e}")
 
-            # Fallback 1: execute desktop commands locally
-            handled = await self._execute_local_voice_command(text)
-            if handled:
-                return
-
-            # Fallback 2: Process conversational query via Ollama local LLM!
+            # Fallback: Process conversational query via configured LLM (Groq / Ollama)!
             try:
-                from core.llm_client import call_llm_stream
-                self.ui.write_log("SYS: Processing query via local Ollama LLM...")
-                ollama_resp = ""
-                for chunk in call_llm_stream(text, system_prompt="You are JARVIS, an autonomous assistant. Answer Sir concisely in 1-2 sentences in their language."):
-                    ollama_resp += chunk
-                if ollama_resp.strip():
-                    ans = ollama_resp.strip()
+                from core.llm_client import call_llm_stream, get_llm_provider
+                provider = get_llm_provider()
+                self.ui.write_log(f"SYS: Processing query via {provider.upper()} LLM...")
+                llm_resp = ""
+                for item in call_llm_stream(text, system_prompt="You are JARVIS, an autonomous assistant. Answer Sir concisely in 1-2 sentences in their language."):
+                    if isinstance(item, dict):
+                        if item.get("type") == "sentence":
+                            llm_resp += item.get("text", "") + " "
+                        elif item.get("type") == "done" and not llm_resp.strip():
+                            llm_resp = item.get("content", "")
+                    elif isinstance(item, str):
+                        llm_resp += item
+                if llm_resp.strip():
+                    ans = llm_resp.strip()
                     self.ui.write_log(f"JARVIS: {ans}")
                     self._session_log.append(f"JARVIS: {ans}")
                     self._speak_local(ans)
                     return
-            except Exception as ollama_err:
-                print(f"[Ollama Fallback] Error: {ollama_err}")
+            except Exception as llm_err:
+                print(f"[LLM Fallback] Error: {llm_err}")
 
             self.ui.write_log("SYS: Gemini session connecting, please wait...")
             self._speak_local("Gemini session is connecting, Sir. Command queued.")
@@ -1026,9 +1332,15 @@ class JarvisLive:
             self._voice_barge_in = bool(_cfg.get("voice_barge_in", True))
             self._wake_word_enabled = bool(_cfg.get("wake_word_enabled", True))
             self._wake_timeout = float(_cfg.get("wake_timeout", 10.0))
-            self._wake_words = _cfg.get("wake_words", None)
-            self._mic_device = _cfg.get("mic_device_index", None)
-            self._stt_language = _cfg.get("stt_language", "en-IN")
+            _raw_mic = _cfg.get("mic_device_index", None)
+            if _raw_mic is None or str(_raw_mic).lower().strip() in ("auto", "none", "null", ""):
+                self._mic_device = None
+            else:
+                try:
+                    self._mic_device = int(_raw_mic)
+                except (ValueError, TypeError):
+                    self._mic_device = None
+            self._stt_language = _cfg.get("stt_language", "bilingual")
         except Exception:
             self._asst_name = "JARVIS"
             _user_name = ""
@@ -1036,7 +1348,7 @@ class JarvisLive:
             self._voice_security_mode = "smart"
             self._voice_threshold = 0.72
             self._voice_continuous_listening = True
-            self._voice_pause_threshold = 0.8
+            self._voice_pause_threshold = 1.0
             self._voice_phrase_time_limit = 15.0
             self._voice_acoustic_cooldown = 0.6
             self._voice_barge_in = True
@@ -1044,7 +1356,7 @@ class JarvisLive:
             self._wake_timeout = 10.0
             self._wake_words = None
             self._mic_device = None
-            self._stt_language = "en-IN"
+            self._stt_language = "bilingual"
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
@@ -1149,6 +1461,24 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
                 result = r or f"Opened {args.get('app_name')}."
 
+            elif name == "close_app":
+                target = (args.get("app_name") or "").lower().strip()
+                if target in ("jarvis", "yourself", "this app", "this application", "jarvis assistant"):
+                    self.ui.prompt_close()
+                    result = "Confirmation requested to close JARVIS, Sir. Please confirm."
+                else:
+                    r = await loop.run_in_executor(None, lambda: close_app(parameters=args, response=None, player=self.ui))
+                    result = r or f"Closed {args.get('app_name', 'application')}."
+
+            elif name == "minimize_app":
+                target = (args.get("app_name") or "").lower().strip()
+                if target in ("jarvis", "yourself", "this app", "this application", "jarvis assistant", ""):
+                    self.ui.minimize()
+                    result = "Minimized JARVIS window, Sir."
+                else:
+                    r = await loop.run_in_executor(None, lambda: minimize_app(parameters=args, response=None, player=self.ui))
+                    result = r or f"Minimized {args.get('app_name', 'application')}."
+
             elif name == "weather_report":
                 r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
                 result = r or "Weather delivered."
@@ -1156,6 +1486,10 @@ class JarvisLive:
             elif name == "browser_control":
                 r = await loop.run_in_executor(None, lambda: browser_control(parameters=args, player=self.ui))
                 result = r or "Done."
+
+            elif name == "auto_answer":
+                r = await loop.run_in_executor(None, lambda: auto_answer(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Auto-answer completed."
 
             elif name == "file_controller":
                 r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
@@ -1170,7 +1504,7 @@ class JarvisLive:
                 result = r or "Reminder set."
 
             elif name == "youtube_video":
-                r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
+                r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui, speak=self.speak))
                 result = r or "Done."
 
             elif name == "screen_process":
@@ -1271,6 +1605,11 @@ class JarvisLive:
                 else:
                     result = "Specify action (add/remove/list) and a topic."
 
+            elif name == "minimize_jarvis":
+                self.ui.write_log("SYS: Window minimized.")
+                self.ui.minimize()
+                result = "Jarvis window minimized to taskbar, Sir."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
@@ -1287,6 +1626,7 @@ class JarvisLive:
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
+                result = "Shutting down, goodbye Sir."
 
             else:
                 if self._plugin_registry.has(name):
@@ -1344,19 +1684,18 @@ class JarvisLive:
                 self.ui.write_log("SYS: Guest voice command blocked (strict mode active).")
                 return
 
-            self.ui.set_voice_status("SIR", "Sir", 1.0)
-
+            full_transcript = (speaker_info.get("full_text") or text).strip()
             speaker_lbl = "Sir"
-            self.ui.write_log(f"{speaker_lbl}: {text}")
-            self._session_log.append(f"{speaker_lbl}: {text}")
-            self.ui.set_input_text(text)
+            self.ui.write_log(f"{speaker_lbl}: {full_transcript}")
+            self._session_log.append(f"{speaker_lbl}: {full_transcript}")
+            self.ui.set_input_text(full_transcript)
 
             if self._dashboard and self._loop:
                 try:
                     asyncio.run_coroutine_threadsafe(
                         self._dashboard.broadcast({
                             "type": "log", "speaker": "user",
-                            "text": text,
+                            "text": full_transcript,
                             "ts": datetime.now().isoformat(),
                         }),
                         self._loop
@@ -1370,10 +1709,10 @@ class JarvisLive:
 
         listener = LiveSpeechListener(
             device_index=self._mic_device,
-            language=getattr(self, "_stt_language", "en-IN"),
-            pause_threshold=getattr(self, "_voice_pause_threshold", 0.8),
-            phrase_time_limit=getattr(self, "_voice_phrase_time_limit", 15.0),
-            acoustic_cooldown=getattr(self, "_voice_acoustic_cooldown", 0.6),
+            language=getattr(self, "_stt_language", "bilingual"),
+            pause_threshold=getattr(self, "_voice_pause_threshold", 0.45),
+            phrase_time_limit=getattr(self, "_voice_phrase_time_limit", 10.0),
+            acoustic_cooldown=getattr(self, "_voice_acoustic_cooldown", 0.3),
             continuous_mode=getattr(self, "_voice_continuous_listening", False),
             voice_barge_in=getattr(self, "_voice_barge_in", True),
             wake_word_enabled=getattr(self, "_wake_word_enabled", True),
@@ -1526,12 +1865,15 @@ class JarvisLive:
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
+        from core.tts import get_preferred_output_device
+        out_dev = get_preferred_output_device()
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
+            device=out_dev,
         )
         stream.start()
 
@@ -1909,6 +2251,11 @@ class JarvisLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        # Persistent STT listener: runs for the entire lifetime of JARVIS.
+        # This guarantees the microphone (Bluetooth or system) is ALWAYS active and
+        # never drops voice commands when Gemini Live is reconnecting or offline.
+        asyncio.create_task(self._listen_audio())
+
         while True:
             current_model = LIVE_MODELS[self._model_index % len(LIVE_MODELS)]
             try:
@@ -1958,7 +2305,6 @@ class JarvisLive:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())

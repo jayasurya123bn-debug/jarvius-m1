@@ -29,7 +29,7 @@ import speech_recognition as sr
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-from core.stt import parse_wake_word
+from core.stt import parse_wake_word, select_bilingual_result
 
 def speak_offline(text: str):
     """Audible response via pyttsx3 SAPI5."""
@@ -43,28 +43,53 @@ def speak_offline(text: str):
         pass
 
 def get_best_input_device():
-    """Find the best input device: prioritize connected headset, then Realtek array."""
+    """Find the best input device: prioritize active Windows default recording device, then USB, then Bluetooth."""
     devices = sd.query_devices()
-    headset_idx = None
-    realtek_idx = None
-    default_idx = sd.default.device[0]
+    default_in = None
+    try:
+        d_in = sd.default.device[0]
+        if d_in is not None and d_in >= 0:
+            default_in = int(d_in)
+    except Exception:
+        pass
 
+    ranked = []
     for i, d in enumerate(devices):
         if d.get("max_input_channels", 0) > 0:
             name = d.get("name", "").lower()
+            if "bthhfenum" in name or "system32" in name:
+                continue
+            score = 0
+            if default_in is not None and i == default_in:
+                score += 100
             if any(k in name for k in ("headset", "hands-free", "m19", "p47", "boult", "airbass", "zyio", "bluetooth")):
-                headset_idx = i
-                break
-            elif "microphone array" in name or "realtek" in name:
-                if realtek_idx is None:
-                    realtek_idx = i
+                score += 25
+            elif "usb" in name:
+                score += 35
+            elif "microphone array" in name or "array" in name:
+                score += 30
+            elif "mic" in name:
+                score += 15
+            if "mapper" in name or "primary" in name:
+                score -= 20
 
-    if headset_idx is not None:
-        return headset_idx, devices[headset_idx]["name"]
+            api_name = sd.query_hostapis(d.get("hostapi", 0)).get("name", "").lower()
+            if "wasapi" in api_name:
+                score += 15
+            elif "mme" in api_name:
+                score += 10
+            elif "directsound" in api_name:
+                score += 5
+
+            ranked.append((score, i, d["name"]))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if ranked and ranked[0][0] > 0:
+        return ranked[0][1], ranked[0][2]
+
+    default_idx = sd.default.device[0]
     if default_idx is not None and default_idx >= 0:
         return default_idx, devices[default_idx]["name"]
-    if realtek_idx is not None:
-        return realtek_idx, devices[realtek_idx]["name"]
     return 1, "Microphone Array"
 
 def main():
@@ -178,12 +203,21 @@ def main():
                         audio_data = sr.AudioData(raw_bytes, sample_rate, 2)
                         text = None
                         try:
-                            text = r.recognize_google(audio_data, language="en-IN").strip()
-                        except sr.UnknownValueError:
-                            try:
-                                text = r.recognize_google(audio_data, language="ta-IN").strip()
-                            except Exception:
-                                pass
+                            import concurrent.futures
+
+                            def _rec(lang: str):
+                                try:
+                                    return r.recognize_google(audio_data, language=lang).strip()
+                                except Exception:
+                                    return None
+
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                                f_ta = executor.submit(_rec, "ta-IN")
+                                f_en = executor.submit(_rec, "en-IN")
+                                res_ta = f_ta.result(timeout=10.0)
+                                res_en = f_en.result(timeout=10.0)
+
+                            text = select_bilingual_result(res_ta, res_en)
                         except Exception as err:
                             print(f"  [STT Network error]: {err}")
 

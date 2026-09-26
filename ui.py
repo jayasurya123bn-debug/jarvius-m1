@@ -783,7 +783,7 @@ class FileDropZone(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(100)
+        self.setFixedHeight(60)
         self._current_file: str | None = None
         self._hovering  = False
         self._drag_over = False
@@ -1842,17 +1842,130 @@ class RemoteKeyOverlay(QWidget):
         self.closed.emit()
 
 
+class ConfirmCloseOverlay(QWidget):
+    """Floating confirmation overlay for closing/shutting down JARVIS."""
+
+    confirmed = pyqtSignal()
+    cancelled = pyqtSignal()
+
+    _OW, _OH = 430, 230
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ConfirmCloseOverlay {{
+                background: rgba(1, 10, 18, 0.97);
+                border: 1px solid {C.RED};
+                border-radius: 10px;
+            }}
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(12)
+
+        # Header title with warning icon
+        hdr = QHBoxLayout()
+        icon_lbl = QLabel("⚠")
+        icon_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
+        icon_lbl.setStyleSheet(f"color: {C.RED}; background: transparent;")
+        hdr.addWidget(icon_lbl)
+
+        title = QLabel("CONFIRM SYSTEM SHUTDOWN")
+        title.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.RED}; background: transparent; letter-spacing: 1px;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        lay.addLayout(hdr)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep)
+
+        msg = QLabel("Are you sure you want to close JARVIS?\nAll active protocols and monitoring will be terminated.")
+        msg.setFont(QFont("Courier New", 9))
+        msg.setStyleSheet(f"color: {C.TEXT}; background: transparent; line-height: 1.4;")
+        msg.setWordWrap(True)
+        lay.addWidget(msg)
+
+        tip = QLabel("Click 'CONFIRM CLOSE' or reply / type 'yes' to close.")
+        tip.setFont(QFont("Courier New", 8))
+        tip.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addWidget(tip)
+
+        lay.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+        btn_row.addStretch()
+
+        self._cancel_btn = QPushButton("CANCEL")
+        self._cancel_btn.setFixedSize(110, 32)
+        self._cancel_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL2}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER_B}; border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                color: {C.WHITE}; border-color: {C.PRI}; background: {C.PRI_GHO};
+            }}
+        """)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        btn_row.addWidget(self._cancel_btn)
+
+        self._confirm_btn = QPushButton("CONFIRM CLOSE")
+        self._confirm_btn.setFixedSize(140, 32)
+        self._confirm_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._confirm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._confirm_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #500a18; color: #ff99aa;
+                border: 1px solid {C.RED}; border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                color: #ffffff; background: {C.RED};
+            }}
+        """)
+        self._confirm_btn.clicked.connect(self._on_confirm)
+        btn_row.addWidget(self._confirm_btn)
+
+        lay.addLayout(btn_row)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_cancel()
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._on_confirm()
+        else:
+            super().keyPressEvent(event)
+
+    def _on_cancel(self):
+        self.hide()
+        self.cancelled.emit()
+
+    def _on_confirm(self):
+        self.hide()
+        self.confirmed.emit()
+
+
 class MainWindow(QMainWindow):
-    _log_sig        = pyqtSignal(str)
-    _state_sig      = pyqtSignal(str)
-    _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
-    _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
-    _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
-    _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
-    _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
-    _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
-    _voice_sig      = pyqtSignal(str, str, float)  # (status, speaker, conf) — VoicePrint status
-    _input_text_sig = pyqtSignal(str)        # update command input text (thread-safe)
+    _log_sig          = pyqtSignal(str)
+    _state_sig        = pyqtSignal(str)
+    _content_sig      = pyqtSignal(str, str)   # (title, text) — thread-safe content display
+    _reconfig_sig     = pyqtSignal()           # trigger setup overlay from any thread
+    _camera_sig       = pyqtSignal(bytes)      # show camera frame preview (small overlay)
+    _cam_stream_sig   = pyqtSignal(bool)       # True=start live stream, False=stop
+    _cam_frame_sig    = pyqtSignal(bytes)      # live camera frame → HUD area
+    _clipboard_sig    = pyqtSignal(str)        # clipboard text changed (thread-safe)
+    _voice_sig        = pyqtSignal(str, str, float)  # (status, speaker, conf) — VoicePrint status
+    _input_text_sig   = pyqtSignal(str)        # update command input text (thread-safe)
+    _min_sig          = pyqtSignal()           # minimize window (thread-safe)
+    _close_prompt_sig = pyqtSignal()         # trigger close confirmation overlay (thread-safe)
+    _close_execute_sig = pyqtSignal()        # execute confirmed close (thread-safe)
+    _close_cancel_sig  = pyqtSignal()        # cancel close confirmation (thread-safe)
+    _tanglish_mic_sig  = pyqtSignal(str)      # ('recording'|'done'|'error') — mic button state
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1891,6 +2004,13 @@ class MainWindow(QMainWindow):
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
+        self._confirm_close_overlay: ConfirmCloseOverlay | None = None
+        self._closing_confirmed: bool = False
+
+        self._min_sig.connect(self.showMinimized)
+        self._close_prompt_sig.connect(self._prompt_close)
+        self._close_execute_sig.connect(self._execute_close)
+        self._close_cancel_sig.connect(self._cancel_close)
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -2002,6 +2122,7 @@ class MainWindow(QMainWindow):
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._voice_sig.connect(self._update_voice_badge)
         self._input_text_sig.connect(self._set_input_text)
+        self._tanglish_mic_sig.connect(self._on_tanglish_mic_state)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -2474,6 +2595,13 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
+        if self._confirm_close_overlay and self._confirm_close_overlay.isVisible():
+            ow, oh = ConfirmCloseOverlay._OW, ConfirmCloseOverlay._OH
+            self._confirm_close_overlay.setGeometry(
+                (cw.width()  - ow) // 2,
+                (cw.height() - oh) // 2,
+                ow, oh,
+            )
         # Camera preview — bottom-right corner of the center/HUD area
         pw = _CameraPreview._W
         ph = self._cam_preview.height() or _CameraPreview._H
@@ -2490,6 +2618,10 @@ class MainWindow(QMainWindow):
             self._position_quick_drawer()
 
     def closeEvent(self, event):
+        if not self._closing_confirmed:
+            event.ignore()
+            self._prompt_close()
+            return
         try:
             self._cam_stop.set()
         except Exception:
@@ -2502,6 +2634,34 @@ class MainWindow(QMainWindow):
         event.accept()
         # Force terminate all background threads/audio/sockets cleanly so nothing stays running
         os._exit(0)
+
+    def _prompt_close(self):
+        cw = self.centralWidget()
+        if not self._confirm_close_overlay:
+            ov = ConfirmCloseOverlay(cw)
+            ov.confirmed.connect(self._execute_close)
+            ov.cancelled.connect(self._cancel_close)
+            self._confirm_close_overlay = ov
+        ow, oh = ConfirmCloseOverlay._OW, ConfirmCloseOverlay._OH
+        self._confirm_close_overlay.setGeometry(
+            (cw.width()  - ow) // 2,
+            (cw.height() - oh) // 2,
+            ow, oh,
+        )
+        self._confirm_close_overlay.show()
+        self._confirm_close_overlay.raise_()
+        self._confirm_close_overlay.setFocus()
+        self._log.append_log("SYS: Close requested. Please confirm shutdown (Click 'CONFIRM CLOSE' or reply 'yes').")
+
+    def _execute_close(self):
+        self._closing_confirmed = True
+        self._log.append_log("SYS: Shutdown confirmed. Closing JARVIS...")
+        self.close()
+
+    def _cancel_close(self):
+        if self._confirm_close_overlay:
+            self._confirm_close_overlay.hide()
+        self._log.append_log("SYS: Close cancelled. JARVIS standing by.")
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -2633,6 +2793,54 @@ class MainWindow(QMainWindow):
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
         lay.addLayout(right_col)
+
+        lay.addSpacing(14)
+
+        # Window controls: Minimize & Close
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(6)
+
+        self._min_btn = QPushButton("─")
+        self._min_btn.setFixedSize(28, 28)
+        self._min_btn.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._min_btn.setToolTip("Minimize JARVIS")
+        self._min_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL2}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO};
+            }}
+            QPushButton:pressed {{
+                background: {C.BORDER_A};
+            }}
+        """)
+        self._min_btn.clicked.connect(self.showMinimized)
+        btn_box.addWidget(self._min_btn)
+
+        self._close_btn = QPushButton("✕")
+        self._close_btn.setFixedSize(28, 28)
+        self._close_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setToolTip("Close JARVIS")
+        self._close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL2}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                color: #ffffff; border-color: {C.RED}; background: {C.RED};
+            }}
+            QPushButton:pressed {{
+                background: #801025;
+            }}
+        """)
+        self._close_btn.clicked.connect(self._prompt_close)
+        btn_box.addWidget(self._close_btn)
+
+        lay.addLayout(btn_box)
         return w
 
     def _tick_clock(self):
@@ -2914,7 +3122,7 @@ class MainWindow(QMainWindow):
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Type a command or question…")
+        self._input.setPlaceholderText("Type a command or question… (or click 🎤 to speak in Tanglish)")
         self._input.setFont(QFont("Courier New", 9))
         self._input.setFixedHeight(30)
         self._input.setStyleSheet(f"""
@@ -2926,6 +3134,24 @@ class MainWindow(QMainWindow):
         """)
         self._input.returnPressed.connect(self._send)
         row.addWidget(self._input)
+
+        # ── Tanglish mic button ───────────────────────────────────────────────
+        self._mic_btn = QPushButton("🎤")
+        self._mic_btn.setFixedSize(30, 30)
+        self._mic_btn.setFont(QFont("Segoe UI Emoji", 11))
+        self._mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mic_btn.setToolTip("Tanglish Voice Input — click and speak (ta-IN + en-IN)")
+        self._mic_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #001a0d; color: {C.GREEN};
+                border: 1px solid {C.GREEN_D}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: #002614; border: 1px solid {C.GREEN}; }}
+            QPushButton:pressed {{ background: #003a1e; }}
+        """)
+        self._mic_btn.clicked.connect(self._on_tanglish_mic_btn)
+        self._mic_recording = False
+        row.addWidget(self._mic_btn)
 
         send = QPushButton("▸")
         send.setFixedSize(30, 30)
@@ -3361,6 +3587,95 @@ class MainWindow(QMainWindow):
     def _set_input_text(self, text: str):
         self._input.setText(text)
 
+    # ── Tanglish mic (one-shot voice → text input) ────────────────────────────
+
+    def _on_tanglish_mic_btn(self):
+        """Start a one-shot Tanglish voice capture in a background thread."""
+        if self._mic_recording:
+            return  # already recording; ignore double-click
+        self._mic_recording = True
+        self._tanglish_mic_sig.emit("recording")
+        t = threading.Thread(target=self._tanglish_mic_listen, daemon=True, name="TanglishMic")
+        t.start()
+
+    def _tanglish_mic_listen(self):
+        """
+        Background thread: capture one phrase from the microphone and transcribe
+        it using the bilingual Tanglish (ta-IN + en-IN) Google STT pipeline,
+        then emit the result into the command input box.
+        """
+        try:
+            import speech_recognition as sr
+            import concurrent.futures
+            from core.stt import select_bilingual_result
+
+            rec = sr.Recognizer()
+            rec.dynamic_energy_threshold = True
+            rec.dynamic_energy_adjustment_damping = 0.15
+            rec.dynamic_energy_ratio = 1.5
+            rec.pause_threshold = 1.0
+            rec.phrase_threshold = 0.2
+            rec.non_speaking_duration = 0.5
+            rec.energy_threshold = 250.0
+
+            with sr.Microphone() as source:
+                rec.adjust_for_ambient_noise(source, duration=0.5)
+                audio = rec.listen(source, timeout=8.0, phrase_time_limit=15.0)
+
+            def _try(lang: str) -> str | None:
+                try:
+                    return rec.recognize_google(audio, language=lang).strip()
+                except Exception:
+                    return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                f_ta = ex.submit(_try, "ta-IN")
+                f_en = ex.submit(_try, "en-IN")
+                res_ta = f_ta.result(timeout=10.0)
+                res_en = f_en.result(timeout=10.0)
+
+            result = select_bilingual_result(res_ta, res_en) or ""
+            if result:
+                self._input_text_sig.emit(result)
+                self._log_sig.emit(f"SYS: Tanglish mic captured: \"{result}\"")
+            else:
+                self._log_sig.emit("SYS: Tanglish mic — no speech detected.")
+            self._tanglish_mic_sig.emit("done")
+        except Exception as e:
+            self._log_sig.emit(f"SYS: Tanglish mic error — {e}")
+            self._tanglish_mic_sig.emit("error")
+        finally:
+            self._mic_recording = False
+
+    def _on_tanglish_mic_state(self, state: str):
+        """Update the mic button appearance based on recording state (called on the GUI thread)."""
+        if not hasattr(self, "_mic_btn"):
+            return
+        if state == "recording":
+            self._mic_btn.setText("🔴")
+            self._mic_btn.setToolTip("Recording… speak in Tanglish now")
+            self._mic_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #1a0000; color: {C.RED};
+                    border: 1px solid {C.RED}; border-radius: 3px;
+                }}
+            """)
+            self._input.setPlaceholderText("🎙 Listening for Tanglish speech…")
+        else:
+            # done or error — restore idle state
+            self._mic_btn.setText("🎤")
+            self._mic_btn.setToolTip("Tanglish Voice Input — click and speak (ta-IN + en-IN)")
+            self._mic_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #001a0d; color: {C.GREEN};
+                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ background: #002614; border: 1px solid {C.GREEN}; }}
+                QPushButton:pressed {{ background: #003a1e; }}
+            """)
+            self._input.setPlaceholderText("Type a command or question… (or click 🎤 to speak in Tanglish)")
+
+
     def _toggle_mute(self):
         self._muted = not self._muted
         self.hud.muted = self._muted
@@ -3396,6 +3711,88 @@ class MainWindow(QMainWindow):
         if not txt: return
         self._input.clear()
         self._log.append_log(f"You: {txt}")
+
+        norm = txt.lower().strip().rstrip(".!?")
+
+        # If confirmation overlay is active, process user confirmation reply
+        if self._confirm_close_overlay and self._confirm_close_overlay.isVisible():
+            affirmative = (
+                "yes", "y", "close", "close it", "close jarvis", "confirm", "ok", "okay",
+                "proceed", "shut down", "shutdown", "exit", "quit", "bye", "yes please",
+                "sure", "do it", "ஆம்", "சரி", "க்ளோஸ்", "க்ளோஸ் பண்ணு", "மூடு",
+                "ஆமா", "ஆமாம்", "sari", "aama", "aamam", "confirm close",
+            )
+            negative = (
+                "no", "n", "cancel", "stop", "abort", "stay", "back", "dont", "don't",
+                "dont close", "don't close", "never mind", "wait", "வேண்டாம்",
+                "இல்லை", "இல்ல", "vendam", "illai", "cancel close",
+            )
+            if any(norm == a or norm.startswith(a + " ") for a in affirmative):
+                self._execute_close()
+                return
+            elif any(norm == n or norm.startswith(n + " ") for n in negative):
+                self._cancel_close()
+                return
+
+        # Direct text commands for JARVIS close control
+        close_jarvis_terms = (
+            "close", "close it", "close jarvis", "close app", "close application",
+            "close window", "close this", "close this window", "shutdown", "shut down",
+            "shutdown jarvis", "shut down jarvis", "exit", "exit jarvis", "quit", "quit jarvis",
+            "bye", "bye jarvis", "goodbye", "goodbye jarvis", "i close", "close tell", "tell close",
+            "மூடு", "க்ளோஸ்", "க்ளோஸ் பண்ணு", "ஜார்விஸ் மூடு", "ஜார்விஸ் க்ளோஸ் பண்ணு",
+            "moodu", "close pannu", "jarvis moodu", "jarvis close",
+        )
+        if norm in close_jarvis_terms or norm.startswith("close jarvis") or norm.startswith("shutdown jarvis") or norm.startswith("exit jarvis"):
+            self._prompt_close()
+            return
+
+        # Direct text commands for JARVIS minimize control
+        min_jarvis_terms = (
+            "minimize", "minimize it", "minimize jarvis", "hide", "hide jarvis",
+            "hide window", "minimize window", "minimize this", "மினிமைஸ்",
+            "minimize pannu", "மினிமைஸ் பண்ணு",
+        )
+        if norm in min_jarvis_terms or norm.startswith("minimize jarvis"):
+            self._log.append_log("SYS: Window minimized.")
+            self.showMinimized()
+            return
+
+        # Named application close
+        if norm.startswith("close "):
+            target_app = norm[6:].strip()
+            if target_app in ("", "jarvis", "yourself", "this", "window", "it", "me", "app", "application"):
+                self._prompt_close()
+                return
+            if target_app:
+                def _do_close():
+                    try:
+                        from actions.open_app import close_app
+                        r = close_app({"app_name": target_app})
+                        self._log.append_log(f"SYS: {r}")
+                    except Exception as e:
+                        self._log.append_log(f"SYS: Error closing {target_app}: {e}")
+                threading.Thread(target=_do_close, daemon=True).start()
+                return
+
+        # Named application minimize
+        if norm.startswith("minimize "):
+            target_app = norm[9:].strip()
+            if target_app in ("", "jarvis", "yourself", "this", "window", "it", "me", "app", "application"):
+                self._log.append_log("SYS: Window minimized.")
+                self.showMinimized()
+                return
+            if target_app:
+                def _do_min():
+                    try:
+                        from actions.open_app import minimize_app
+                        r = minimize_app({"app_name": target_app})
+                        self._log.append_log(f"SYS: {r}")
+                    except Exception as e:
+                        self._log.append_log(f"SYS: Error minimizing {target_app}: {e}")
+                threading.Thread(target=_do_min, daemon=True).start()
+                return
+
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
@@ -3565,3 +3962,23 @@ class JarvisUI:
     def set_input_text(self, text: str) -> None:
         """Thread-safe: update the Command Input text field."""
         self._win._input_text_sig.emit(text)
+
+    def minimize(self) -> None:
+        """Thread-safe: minimize the JARVIS window."""
+        self._win._min_sig.emit()
+
+    def prompt_close(self) -> None:
+        """Thread-safe: show confirmation dialog to close JARVIS."""
+        self._win._close_prompt_sig.emit()
+
+    def is_confirm_close_visible(self) -> bool:
+        """Return True if the close confirmation dialog is currently visible."""
+        return bool(self._win._confirm_close_overlay and self._win._confirm_close_overlay.isVisible())
+
+    def confirm_close(self) -> None:
+        """Thread-safe: execute confirmed shutdown of JARVIS."""
+        self._win._close_execute_sig.emit()
+
+    def cancel_close(self) -> None:
+        """Thread-safe: cancel shutdown confirmation overlay."""
+        self._win._close_cancel_sig.emit()

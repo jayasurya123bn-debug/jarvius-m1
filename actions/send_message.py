@@ -1,8 +1,15 @@
 import json
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     import pyautogui
@@ -124,6 +131,227 @@ def _open_browser_url(url: str) -> bool:
         print(f"[SendMessage] ⚠️ Could not open browser: {e}")
         return False
 
+
+# ── Tamil & Tanglish Contact Name Sanitization ────────────────────────────────
+TAMIL_COMMON_NAMES = {
+    "அம்மா": "Amma",
+    "அப்பா": "Appa",
+    "அண்ணா": "Anna",
+    "அக்கா": "Akka",
+    "தம்பி": "Thambi",
+    "தங்கச்சி": "Thangachi",
+    "அருண்": "Arun",
+    "கார்த்திக்": "Karthik",
+    "ராகுல்": "Rahul",
+    "சுரேஷ்": "Suresh",
+    "ரமேஷ்": "Ramesh",
+    "விஜய்": "Vijay",
+    "அஜித்": "Ajith",
+    "பிரவீன்": "Praveen",
+    "தினேஷ்": "Dinesh",
+    "பிரசாத்": "Prasad",
+    "மோகன்": "Mohan",
+    "சரவணன்": "Saravanan",
+    "மணி": "Mani",
+    "சிவா": "Siva",
+    "பாலா": "Bala",
+    "குமார்": "Kumar",
+    "சந்தோஷ்": "Santhosh",
+    "ஹரி": "Hari",
+    "கணேஷ்": "Ganesh",
+}
+
+TAMIL_DATIVE_STEMS = [
+    ("ணுக்கு", "ண்"),
+    ("லுக்கு", "ல்"),
+    ("ருக்கு", "ர்"),
+    ("ஷுக்கு", "ஷ்"),
+    ("க்குக்கு", "க்"),
+    ("வுக்கு", ""),
+    ("உக்கு", ""),
+    ("க்கு", ""),
+    ("ணு", "ண்"),
+    ("லு", "ல்"),
+    ("ரு", "ர்"),
+    ("ஷு", "ஷ்"),
+]
+
+VOWELS = {
+    'அ': 'A', 'ஆ': 'Aa', 'இ': 'I', 'ஈ': 'Ee', 'உ': 'U', 'ஊ': 'Oo',
+    'எ': 'E', 'ஏ': 'Ae', 'ஐ': 'Ai', 'ஒ': 'O', 'ஓ': 'O', 'ஔ': 'Au'
+}
+
+CONSONANTS = {
+    'க': 'k', 'ங': 'ng', 'ச': 's', 'ஞ': 'nj', 'ட': 'd', 'ண': 'n',
+    'த': 'th', 'ந': 'n', 'ப': 'p', 'ம': 'm', 'ய': 'y', 'ர': 'r',
+    'ல': 'l', 'வ': 'v', 'ழ': 'zh', 'ள': 'l', 'ற': 'r', 'ன': 'n',
+    'ஜ': 'j', 'ஷ': 'sh', 'ஸ': 's', 'ஹ': 'h'
+}
+
+VOWEL_SIGNS = {
+    'ா': 'aa', 'ி': 'i', 'ீ': 'ee', 'ு': 'u', 'ூ': 'oo',
+    'ெ': 'e', 'ே': 'e', 'ை': 'ai', 'ொ': 'o', 'ோ': 'o', 'ௌ': 'au',
+    '்': ''
+}
+
+def strip_tamil_dative_suffix(name: str) -> str:
+    """Strips Tamil dative suffixes and stems inflected consonants (e.g. அருணுக்கு -> அருண்)."""
+    for sfx, rep in TAMIL_DATIVE_STEMS:
+        if name.endswith(sfx):
+            return name[:-len(sfx)] + rep
+    return name
+
+def transliterate_tamil(word: str) -> str:
+    """Fallback transliterator from Tamil script to Latin English phonetics."""
+    clean_w = word.strip()
+    if clean_w in TAMIL_COMMON_NAMES:
+        return TAMIL_COMMON_NAMES[clean_w]
+
+    out = []
+    i = 0
+    chars = list(clean_w)
+    while i < len(chars):
+        c = chars[i]
+        if c in VOWELS:
+            out.append(VOWELS[c])
+            i += 1
+        elif c in CONSONANTS:
+            base = CONSONANTS[c]
+            if i + 1 < len(chars) and chars[i + 1] in VOWEL_SIGNS:
+                sign = VOWEL_SIGNS[chars[i + 1]]
+                out.append(base + sign)
+                i += 2
+            else:
+                out.append(base + ('a' if i + 1 < len(chars) and chars[i+1] in CONSONANTS else ''))
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out).strip().title()
+
+def clean_contact_name_for_search(name: str) -> str:
+    """
+    Cleans contact names for English search in WhatsApp:
+    - Strips prefixes like 'to', 'contact', 'for'
+    - Strips Tamil dative suffixes ('-ku', 'ku', 'kitta', 'kooda', 'உக்கு', 'க்கு', 'வுக்கு')
+    - Transliterates Tamil script into English Latin name
+    - Capitalizes cleanly
+    """
+    raw = (name or "").strip().strip(" \"':;,.-")
+    if not raw:
+        return ""
+
+    # Strip English/Tanglish prefixes
+    raw = re.sub(r"^(?:to\s+|contact\s+|for\s+)", "", raw, flags=re.IGNORECASE).strip()
+
+    # Strip trailing "in whatsapp" or "on whatsapp" if captured accidentally
+    raw = re.sub(r"\s+(?:in|on)\s+whatsapp$", "", raw, flags=re.IGNORECASE).strip()
+
+    # Strip Tamil dative case markers from Tamil script
+    raw = strip_tamil_dative_suffix(raw)
+
+    # Check known Tamil names directly
+    if raw in TAMIL_COMMON_NAMES:
+        return TAMIL_COMMON_NAMES[raw]
+
+    # Strip Latin Tanglish suffixes: "-ku", " ku", " kitta", " kooda", "ukku"
+    raw = re.sub(r"(?:-ku|\s+ku|\s+kitta|\s+kooda|ukku|ku)$", "", raw, flags=re.IGNORECASE).strip(" -_")
+
+    if raw in TAMIL_COMMON_NAMES:
+        return TAMIL_COMMON_NAMES[raw]
+
+    for tn, en in TAMIL_COMMON_NAMES.items():
+        if raw.startswith(tn):
+            return en
+
+    # If still contains Tamil script, transliterate phonetically
+    if re.search(r"[\u0B80-\u0BFF]", raw):
+        return transliterate_tamil(raw)
+
+    return raw.strip().title()
+
+def parse_whatsapp_voice_command(text: str) -> tuple[str | None, str | None]:
+    """
+    Parse a voice or text command into (receiver, message_text) where:
+    - receiver: Contact name sanitized into English for WhatsApp contact search
+    - message_text: Tanglish / Tamil / English message to be sent
+    Returns (None, None) if not a WhatsApp messaging command.
+    """
+    if not text:
+        return None, None
+
+    t = text.strip()
+    t_lower = t.lower()
+
+    if not any(k in t_lower for k in ("whatsapp", "வாட்ஸ்அப்", "வாட்சப்", "வாட்ஸப்")):
+        return None, None
+
+    WA_PFX = r"(?:whatsapp(?:\s+la|\s+le|\s+laa|la|le)?|வாட்ஸ்அப்(?:ல|la)?|வாட்சப்(?:ல)?|வாட்ஸப்(?:ல)?)"
+    CASE_MARKERS = r"(?:\s+ku|\s+kitta|\s+kooda|\s+க்கு|\s+வுக்கு|-ku|க்கு|வுக்கு)"
+    ACTION_VERBS = r"(?:\s+anupu|\s+anupunga|\s+pannu|\s+pannunga|\s+send\s+pannu|\s+send|\s+போடு|\s+அனுப்பு|\s+பண்ணு|\s+podu|\s+podunga|\s+sollu|\s+solunga)"
+
+    # Pattern 0A: Contact first ("Arun ku whatsapp la naan varren nu message anupu")
+    m0a = re.search(
+        rf"^([a-zA-Z0-9_\u0B80-\u0BFF]+(?:\s+[a-zA-Z0-9_\u0B80-\u0BFF]+)?){CASE_MARKERS}\s+{WA_PFX}\s+(.+?)\s+(?:nu|endru|என்று)\s+(?:message|msg|மெசேஜ்)(?:{ACTION_VERBS})?$",
+        t, re.IGNORECASE
+    )
+    if m0a:
+        contact = clean_contact_name_for_search(m0a.group(1))
+        msg = m0a.group(2).strip()
+        return contact, msg
+
+    # Pattern 0B: Contact first + direct message ("Arun ku whatsapp la message pannu: enna pandra")
+    m0b = re.search(
+        rf"^([a-zA-Z0-9_\u0B80-\u0BFF]+(?:\s+[a-zA-Z0-9_\u0B80-\u0BFF]+)?){CASE_MARKERS}\s+{WA_PFX}\s+(?:message|msg|மெசேஜ்)(?:{ACTION_VERBS})?\s*[:,-]?\s*(.+)$",
+        t, re.IGNORECASE
+    )
+    if m0b:
+        contact = clean_contact_name_for_search(m0b.group(1))
+        msg = m0b.group(2).strip().lstrip(":,- ")
+        return contact, msg
+
+    # Pattern 1: With explicit Tamil/Tanglish case marker ("whatsapp la Arun ku ... nu message anupu"):
+    m1 = re.search(
+        rf"^{WA_PFX}\s+([a-zA-Z0-9_\u0B80-\u0BFF]+(?:\s+[a-zA-Z0-9_\u0B80-\u0BFF]+)?){CASE_MARKERS}\s+(.+?)\s+(?:nu|endru|என்று)\s+(?:message|msg|மெசேஜ்)(?:{ACTION_VERBS})?$",
+        t, re.IGNORECASE
+    )
+    if m1:
+        contact = clean_contact_name_for_search(m1.group(1))
+        msg = m1.group(2).strip()
+        return contact, msg
+
+    # Pattern 2: Explicit case marker + message marker ("whatsapp la rahul ku message pannu: enna pandra")
+    m2 = re.search(
+        rf"^{WA_PFX}\s+([a-zA-Z0-9_\u0B80-\u0BFF]+(?:\s+[a-zA-Z0-9_\u0B80-\u0BFF]+)?){CASE_MARKERS}\s+(?:message|msg|மெசேஜ்)(?:{ACTION_VERBS})?\s*[:,-]?\s*(.+)$",
+        t, re.IGNORECASE
+    )
+    if m2:
+        contact = clean_contact_name_for_search(m2.group(1))
+        msg = m2.group(2).strip().lstrip(":,- ")
+        return contact, msg
+
+    # Pattern 3: English "send [whatsapp] message to <contact> [in/on whatsapp] saying <msg>"
+    m3 = re.search(
+        r"^(?:send\s+)?(?:a\s+)?(?:whatsapp\s+)?(?:message|msg)\s+(?:on\s+whatsapp\s+|in\s+whatsapp\s+)?to\s+([a-zA-Z0-9_\u0B80-\u0BFF]+(?:\s+[a-zA-Z0-9_\u0B80-\u0BFF]+)?)(?:\s+(?:on|in)\s+whatsapp)?\s*(?:saying|[:,-])\s*(.+)$",
+        t, re.IGNORECASE
+    )
+    if m3:
+        contact = clean_contact_name_for_search(m3.group(1))
+        msg = m3.group(2).strip().lstrip(":,- ")
+        return contact, msg
+
+    # Pattern 4: Direct "whatsapp <contact> message <msg>"
+    m4 = re.search(
+        rf"^{WA_PFX}\s+([a-zA-Z0-9_\u0B80-\u0BFF]+(?:\s+[a-zA-Z0-9_\u0B80-\u0BFF]+)?)\s+(?:message|msg|மெசேஜ்)\s*[:,-]?\s*(.+)$",
+        t, re.IGNORECASE
+    )
+    if m4:
+        contact = clean_contact_name_for_search(m4.group(1))
+        msg = m4.group(2).strip().lstrip(":,- ")
+        return contact, msg
+
+    return None, None
+
 def _search_in_app(query: str) -> None:
     _require_pyautogui()
     os_name = _get_os()
@@ -150,7 +378,8 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
     return f"Message sent to {receiver} via {app_name}."
 
 def _send_whatsapp(receiver: str, message: str) -> str:
-    return _desktop_send("WhatsApp", receiver, message)
+    search_name = clean_contact_name_for_search(receiver)
+    return _desktop_send("WhatsApp", search_name, message)
 
 def _send_telegram(receiver: str, message: str) -> str:
     return _desktop_send("Telegram", receiver, message)
@@ -237,7 +466,8 @@ def send_message(
     session_memory=None,
 ) -> str:
     params       = parameters or {}
-    receiver     = params.get("receiver", "").strip()
+    raw_receiver = params.get("receiver", "").strip()
+    receiver     = clean_contact_name_for_search(raw_receiver) or raw_receiver
     message_text = params.get("message_text", "").strip()
     platform     = params.get("platform", "whatsapp").strip()
 
@@ -249,7 +479,7 @@ def send_message(
         return "PyAutoGUI is not installed — cannot control the desktop."
 
     preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
-    print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")
+    print(f"[SendMessage] 📨 {platform} → {receiver} (raw: '{raw_receiver}'): {preview}")
     if player:
         player.write_log(f"[msg] {platform} → {receiver}")
 

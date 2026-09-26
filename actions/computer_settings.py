@@ -694,6 +694,28 @@ def computer_settings(
         scroll_down(int(value or 500))
         return "Scrolled down."
 
+    if action in ("close_app", "close_window"):
+        target = str(value or description or params.get("app_name", "")).strip()
+        if target and target.lower() not in ("current", "active", "this", "window", "app"):
+            try:
+                from actions.open_app import close_app as _ca
+                return _ca({"app_name": target})
+            except Exception:
+                pass
+        close_app()
+        return "Closed window, Sir."
+
+    if action in ("minimize", "minimize_window", "minimize_app"):
+        target = str(value or description or params.get("app_name", "")).strip()
+        if target and target.lower() not in ("current", "active", "this", "window", "app"):
+            try:
+                from actions.open_app import minimize_app as _ma
+                return _ma({"app_name": target})
+            except Exception:
+                pass
+        minimize_window()
+        return "Minimized window, Sir."
+
     func = ACTION_MAP.get(action)
     if not func:
         return f"Unknown action: '{raw_action}'."

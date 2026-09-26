@@ -410,6 +410,54 @@ def get_desktop_stats() -> str:
         f"  Path    : {desktop}"
     )
 
+def create_desktop_shortcut(target_path: str, name: str = "", icon_path: str = "") -> str:
+    desktop = _get_desktop()
+    if _OS == "Windows":
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+            base_name = name or Path(target_path).stem
+            if not base_name.lower().endswith(".lnk"):
+                base_name += ".lnk"
+            shortcut_path = desktop / base_name
+            sc = shell.CreateShortcut(str(shortcut_path))
+            sc.TargetPath = str(target_path)
+            sc.WorkingDirectory = str(Path(target_path).parent)
+            if icon_path:
+                sc.IconLocation = str(icon_path)
+            sc.Save()
+            return f"Created desktop shortcut: {shortcut_path}"
+        except Exception as e:
+            try:
+                base_name = name or Path(target_path).stem
+                if not base_name.lower().endswith(".lnk"):
+                    base_name += ".lnk"
+                shortcut_path = desktop / base_name
+                ps_cmd = (
+                    f'$ws = New-Object -ComObject WScript.Shell; '
+                    f'$sc = $ws.CreateShortcut("{shortcut_path}"); '
+                    f'$sc.TargetPath = "{target_path}"; '
+                    f'$sc.Save()'
+                )
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True, capture_output=True)
+                return f"Created desktop shortcut via PowerShell: {shortcut_path}"
+            except Exception as pe:
+                return f"Failed to create shortcut: {e}; PS: {pe}"
+    elif _OS == "Linux":
+        base_name = name or Path(target_path).stem
+        dot_desktop = desktop / f"{base_name}.desktop"
+        content = f"[Desktop Entry]\nName={base_name}\nExec={target_path}\nType=Application\n"
+        dot_desktop.write_text(content, encoding="utf-8")
+        dot_desktop.chmod(0o755)
+        return f"Created desktop entry: {dot_desktop}"
+    elif _OS == "Darwin":
+        base_name = name or Path(target_path).stem
+        alias_path = desktop / base_name
+        subprocess.run(["ln", "-s", target_path, str(alias_path)], check=True)
+        return f"Created desktop alias: {alias_path}"
+    return "Unsupported OS for desktop shortcuts."
+
+
 def desktop_control(
     parameters: dict = None,
     response=None,
@@ -419,12 +467,15 @@ def desktop_control(
     """
     parameters:
         action : wallpaper | wallpaper_url | current_wallpaper |
-                 organize  | clean | list | stats |
+                 organize  | clean | list | stats | create_shortcut |
                  task (AI-powered)
         path   : image path for 'wallpaper'
         url    : image URL for 'wallpaper_url'
         mode   : 'by_type' or 'by_date' for 'organize'
         task   : natural language description for AI-powered actions
+        target : target path for shortcut
+        name   : shortcut name
+        icon   : icon path for shortcut
     """
     params = parameters or {}
     action = params.get("action", "").lower().strip()
@@ -444,6 +495,12 @@ def desktop_control(
 
         elif action == "current_wallpaper":
             return get_current_wallpaper()
+
+        elif action in ("create_shortcut", "shortcut", "create_icon"):
+            target = params.get("target") or params.get("path") or params.get("app") or ""
+            name   = params.get("name", "")
+            icon   = params.get("icon", "")
+            return create_desktop_shortcut(target, name, icon) if target else "Target app or path required for shortcut."
 
         elif action == "organize":
             return organize_desktop(params.get("mode", "by_type"))

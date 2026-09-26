@@ -17,6 +17,7 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -42,13 +43,21 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
     "llm_model":    "llama3.2",
-    "llm_provider": "ollama",   # "ollama" | "openai"
+    "llm_provider": "ollama",   # "ollama" | "openai" | "groq" | "claude"
 }
+
+_CLAUDE_API_BASE = "https://api.anthropic.com/v1"
+_CLAUDE_DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
+_ANTHROPIC_VERSION = "2023-06-01"
 
 
 def get_llm_provider() -> str:
-    """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
+    """Returns 'ollama', 'openai', 'groq', or 'claude'."""
     raw = _load_config().get("llm_provider", "ollama").strip().lower()
+    if raw in ("claude", "anthropic"):
+        return "claude"
+    if raw == "groq":
+        return "groq"
     return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
 
 
@@ -59,31 +68,75 @@ def _load_config() -> dict:
         return {}
 
 
+def get_llm_api_key() -> str:
+    """Returns the API key for the configured LLM provider."""
+    cfg = _load_config()
+    provider = get_llm_provider()
+    if provider == "groq":
+        return cfg.get("groq_api_key") or os.environ.get("GROQ_API_KEY", "")
+    if provider == "claude":
+        return cfg.get("claude_api_key") or cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    return cfg.get("openai_api_key") or cfg.get("llm_api_key") or os.environ.get("OPENAI_API_KEY", "")
+
+
+def _get_headers() -> dict:
+    key = get_llm_api_key()
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 def ensure_ollama_running(timeout: int = 15) -> bool:
     """
     For Ollama: ping /api/tags; auto-launch 'ollama serve' if not running.
-    For OpenAI-compatible providers: just ping /v1/models (server must be started manually).
+    For OpenAI/Groq compatible providers: just ping /v1/models (server must be started manually).
     Returns True if the LLM server is reachable.
     """
     url, _   = get_llm_settings()
     provider = get_llm_provider()
 
-    if provider == "openai":
-        # OpenAI-compatible servers (LM Studio, LocalAI, etc.) must be started
-        # by the user — we just check if they're reachable.
+    if provider in ("openai", "groq"):
+        # OpenAI/Groq compatible servers
         health = f"{url}/v1/models"
         try:
-            ok = requests.get(health, timeout=5).status_code == 200
+            ok = requests.get(health, headers=_get_headers(), timeout=5).status_code == 200
             if ok:
-                print(f"[LLM] OpenAI-compatible server reachable at {url}")
+                print(f"[LLM] {provider.upper()} server reachable at {url}")
             else:
-                print(f"[LLM] Server at {url} returned non-200.  Is it running?")
+                print(f"[LLM] Server at {url} returned non-200. Is the API key valid?")
             return ok
         except Exception as e:
             print(
-                f"[LLM] Cannot reach OpenAI-compatible server at {url}.\n"
-                "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
+                f"[LLM] Cannot reach {provider.upper()} server at {url}.\n"
+                f"      Details: {e}"
             )
+            return False
+
+    if provider == "claude":
+        # Ping Anthropic API with a minimal request
+        api_key = get_llm_api_key()
+        if not api_key:
+            print("[LLM] Claude API key not configured. Set 'claude_api_key' in config/api_keys.json")
+            return False
+        try:
+            resp = requests.post(
+                f"{_CLAUDE_API_BASE}/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": _ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+                json={"model": _CLAUDE_DEFAULT_MODEL, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+                timeout=8,
+            )
+            if resp.status_code in (200, 400):  # 400 = bad request but server is up
+                print("[LLM] Claude (Anthropic) API reachable.")
+                return True
+            print(f"[LLM] Claude API returned {resp.status_code}: {resp.text[:200]}")
+            return False
+        except Exception as e:
+            print(f"[LLM] Cannot reach Claude API: {e}")
             return False
 
     # ── Ollama ──────────────────────────────────────────────────────────────
@@ -146,8 +199,8 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": "hi"})
 
-    if provider == "openai":
-        # OpenAI-compatible: just fire a minimal request to ensure the model is loaded.
+    if provider in ("openai", "groq"):
+        # OpenAI/Groq compatible: just fire a minimal request to ensure the model is loaded.
         # No keep_alive or KV-cache priming available — server manages this internally.
         payload = {
             "model":      model,
@@ -156,9 +209,9 @@ def warmup_model(system_prompt: str | None = None) -> bool:
             "max_tokens": 1,
         }
         try:
-            resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
+            resp = requests.post(f"{url}/v1/chat/completions", json=payload, headers=_get_headers(), timeout=180)
             resp.raise_for_status()
-            print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
+            print(f"[LLM] '{model}' ready ({provider.upper()}).")
             return True
         except Exception as e:
             print(f"[LLM] Warmup failed (non-fatal): {e}")
@@ -275,7 +328,16 @@ def check_llm_readiness(auto_pull: bool = True) -> tuple[bool, str]:
 
 def get_llm_settings() -> tuple[str, str]:
     """Returns (base_url, model_name)."""
-    cfg   = _load_config()
+    cfg      = _load_config()
+    provider = get_llm_provider()
+    if provider == "groq":
+        url   = cfg.get("llm_url", "https://api.groq.com/openai").rstrip("/")
+        model = cfg.get("llm_model", "qwen/qwen3.8-27b")
+        return url, model
+    if provider == "claude":
+        url   = _CLAUDE_API_BASE
+        model = cfg.get("llm_model", _CLAUDE_DEFAULT_MODEL)
+        return url, model
     url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
     model = cfg.get("llm_model", _DEFAULTS["llm_model"])
     return url, model
@@ -287,7 +349,7 @@ def call_llm(
     timeout:  int = 120,
 ) -> dict:
     """
-    Non-streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
+    Non-streaming chat request.  Routes to Ollama or OpenAI/Groq compatible backend.
 
     Returns:
         {"content": str, "tool_calls": list}
@@ -295,7 +357,10 @@ def call_llm(
     url, model = get_llm_settings()
     provider   = get_llm_provider()
 
-    if provider == "openai":
+    if provider == "claude":
+        return _call_llm_claude(messages, tools, timeout)
+
+    if provider in ("openai", "groq"):
         endpoint = f"{url}/v1/chat/completions"
         payload: dict = {
             "model":      model,
@@ -307,7 +372,7 @@ def call_llm(
             payload["tools"]       = tools
             payload["tool_choice"] = "auto"
         try:
-            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp = requests.post(endpoint, json=payload, headers=_get_headers(), timeout=timeout)
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             msg    = choice.get("message", {})
@@ -331,8 +396,17 @@ def call_llm(
                 "content":    (msg.get("content") or "").strip(),
                 "tool_calls": tc_list,
             }
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            _is_transient = status in (429, 503) or any(
+                k in str(e).lower() for k in ("rate", "quota", "unavailable", "high demand", "overloaded")
+            )
+            if _is_transient:
+                print(f"[LLM] {provider.upper()} {status} - falling back to Ollama llama3.2, Sir...")
+                return _ollama_fallback_call(messages, tools, timeout)
+            raise RuntimeError(f"{provider.upper()} LLM call failed: {e}")
         except Exception as e:
-            raise RuntimeError(f"OpenAI-compatible LLM call failed: {e}")
+            raise RuntimeError(f"{provider.upper()} LLM call failed: {e}")
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     endpoint = f"{url}/api/chat"
@@ -391,6 +465,293 @@ def call_llm(
         raise RuntimeError(f"LLM call failed: {e}")
 
 
+def _call_llm_claude(
+    messages: list,
+    tools:    list | None,
+    timeout:  int,
+) -> dict:
+    """
+    Non-streaming Claude (Anthropic Messages API) call.
+    Converts OpenAI-style tool definitions to Anthropic format.
+    """
+    _, model = get_llm_settings()
+    api_key  = get_llm_api_key()
+    if not api_key:
+        raise RuntimeError("Claude API key not configured. Set 'claude_api_key' in config/api_keys.json")
+
+    headers = {
+        "x-api-key":         api_key,
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "content-type":      "application/json",
+    }
+
+    # Separate system messages from conversation
+    system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+    conv_messages = [m for m in messages if m.get("role") != "system"]
+    system_text   = "\n\n".join(system_parts) if system_parts else None
+
+    payload: dict = {
+        "model":      model,
+        "max_tokens": 1024,
+        "messages":   conv_messages,
+    }
+    if system_text:
+        payload["system"] = system_text
+
+    # Convert OpenAI-style tools → Anthropic tools format
+    if tools:
+        anthropic_tools = []
+        for t in tools:
+            fn = t.get("function", t)
+            anthropic_tools.append({
+                "name":         fn.get("name", ""),
+                "description":  fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        payload["tools"] = anthropic_tools
+
+    try:
+        resp = requests.post(f"{_CLAUDE_API_BASE}/messages", json=payload, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+
+        content_blocks = data.get("content", [])
+        text_content   = " ".join(b.get("text", "") for b in content_blocks if b.get("type") == "text").strip()
+        tool_calls     = [
+            {
+                "id":       b.get("id", ""),
+                "function": {"name": b.get("name", ""), "arguments": b.get("input", {})},
+            }
+            for b in content_blocks if b.get("type") == "tool_use"
+        ]
+        return {"content": text_content, "tool_calls": tool_calls}
+
+    except Exception as e:
+        raise RuntimeError(f"Claude LLM call failed: {e}")
+
+
+def _stream_claude(
+    messages: list,
+    tools:    list | None,
+    timeout:  int,
+) -> Generator[dict, None, None]:
+    """
+    Streaming Claude (Anthropic) backend.
+    Parses Anthropic SSE stream and yields sentence/done events
+    matching the same output format as _stream_openai().
+    """
+    _, model = get_llm_settings()
+    api_key  = get_llm_api_key()
+    if not api_key:
+        raise RuntimeError("Claude API key not configured. Set 'claude_api_key' in config/api_keys.json")
+
+    headers = {
+        "x-api-key":         api_key,
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "content-type":      "application/json",
+    }
+
+    # Separate system messages
+    system_parts  = [m["content"] for m in messages if m.get("role") == "system"]
+    conv_messages = [m for m in messages if m.get("role") != "system"]
+    system_text   = "\n\n".join(system_parts) if system_parts else None
+
+    payload: dict = {
+        "model":      model,
+        "max_tokens": 1024,
+        "stream":     True,
+        "messages":   conv_messages,
+    }
+    if system_text:
+        payload["system"] = system_text
+    if tools:
+        anthropic_tools = []
+        for t in tools:
+            fn = t.get("function", t)
+            anthropic_tools.append({
+                "name":         fn.get("name", ""),
+                "description":  fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        payload["tools"] = anthropic_tools
+
+    try:
+        with requests.post(
+            f"{_CLAUDE_API_BASE}/messages",
+            json=payload, headers=headers, timeout=timeout, stream=True
+        ) as resp:
+            resp.raise_for_status()
+            full_content = ""
+            buf          = ""
+            tool_calls:  list = []
+            # Accumulate tool-use blocks by index
+            tc_blocks:   dict = {}  # index -> {"id", "name", "input_str"}
+
+            for raw in resp.iter_lines():
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data in ("[DONE]", ""):
+                    break
+
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                # Text delta
+                if event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        full_content += text
+                        buf          += text
+                        # Flush complete sentences for streaming TTS
+                        while True:
+                            m = _SENT_END.search(buf)
+                            if not m:
+                                break
+                            sentence = buf[: m.start() + 1].strip()
+                            buf      = buf[m.end():]
+                            if sentence:
+                                yield {"type": "sentence", "text": sentence}
+                    elif delta.get("type") == "input_json_delta":
+                        idx = event.get("index", 0)
+                        if idx in tc_blocks:
+                            tc_blocks[idx]["input_str"] += delta.get("partial_json", "")
+
+                elif event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        idx = event.get("index", 0)
+                        tc_blocks[idx] = {
+                            "id":        block.get("id", ""),
+                            "name":      block.get("name", ""),
+                            "input_str": "",
+                        }
+
+                elif event_type == "message_stop":
+                    break
+
+            # Flush trailing buffer
+            if buf.strip():
+                yield {"type": "sentence", "text": buf.strip()}
+
+            # Parse tool-call blocks
+            for idx in sorted(tc_blocks):
+                blk = tc_blocks[idx]
+                try:
+                    args = json.loads(blk["input_str"]) if blk["input_str"] else {}
+                except Exception:
+                    args = blk["input_str"]
+                tool_calls.append({
+                    "id":       blk["id"],
+                    "function": {"name": blk["name"], "arguments": args},
+                })
+
+            yield {
+                "type":       "done",
+                "content":    full_content.strip(),
+                "tool_calls": tool_calls,
+            }
+
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Cannot reach Claude API. Check your internet connection.")
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Claude stream timed out.")
+    except requests.exceptions.HTTPError as e:
+        err_detail = ""
+        try:
+            err_detail = e.response.json().get("error", {}).get("message", "")
+        except Exception:
+            err_detail = e.response.text if e.response is not None else ""
+        raise RuntimeError(f"Claude HTTP error {e.response.status_code if e.response else 'unknown'}: {err_detail or e}")
+    except Exception as e:
+        raise RuntimeError(f"Claude stream failed: {e}")
+
+
+def _ensure_local_ollama_running(timeout: int = 15) -> bool:
+    """Ensure local Ollama service specifically is reachable at http://localhost:11434."""
+    health = "http://localhost:11434/api/tags"
+
+    def _is_up() -> bool:
+        try:
+            return requests.get(health, timeout=3).status_code == 200
+        except Exception:
+            return False
+
+    if _is_up():
+        return True
+
+    print("[LLM] Ollama not running - launching 'ollama serve'...")
+    try:
+        kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        ollama_bin = "ollama"
+        local_exe = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe")
+        if os.path.exists(local_exe):
+            ollama_bin = local_exe
+
+        subprocess.Popen([ollama_bin, "serve"], **kwargs)
+    except Exception as e:
+        print(f"[LLM] Could not launch Ollama: {e}")
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1.0)
+        if _is_up():
+            print("[LLM] Ollama started successfully.")
+            return True
+
+    print("[LLM] Ollama did not respond within the timeout.")
+    return False
+
+
+def _ollama_fallback_call(
+    messages: list,
+    tools:    list | None = None,
+    timeout:  int = 120,
+) -> dict:
+    """
+    Emergency Ollama llama3.2 fallback for when cloud providers (Groq/Gemini)
+    return 429/503. Starts Ollama if not already running.
+    """
+    ollama_url   = "http://localhost:11434"
+    ollama_model = "llama3.2"
+    print(f"[LLM] [FALLBACK] Ollama fallback active - using {ollama_model}")
+    if not _ensure_local_ollama_running():
+        raise RuntimeError(
+            "Cloud LLM returned 503/429 AND Ollama is not available. "
+            "Install Ollama from https://ollama.com and run: ollama pull llama3.2"
+        )
+    endpoint = f"{ollama_url}/api/chat"
+    payload: dict = {
+        "model":      ollama_model,
+        "messages":   messages,
+        "stream":     False,
+        "keep_alive": -1,
+        "options":    {"num_predict": 150, "num_gpu": 99},
+    }
+    if tools:
+        payload["tools"] = tools
+    resp = requests.post(endpoint, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg  = data.get("message", {})
+    return {
+        "content":    (msg.get("content") or "").strip(),
+        "tool_calls": msg.get("tool_calls") or [],
+    }
+
+
 def call_llm_text(
     prompt:  str,
     system:  str | None = None,
@@ -402,7 +763,7 @@ def call_llm_text(
     Used by planner, executor, error_handler, code_helper, dev_agent.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
+    provider = get_llm_provider()
     m        = model or default_model
 
     messages: list[dict] = []
@@ -410,6 +771,22 @@ def call_llm_text(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    if provider == "claude":
+        result = _call_llm_claude(messages, None, timeout)
+        return result.get("content", "")
+
+    if provider in ("openai", "groq"):
+        endpoint = f"{url}/v1/chat/completions"
+        payload = {"model": m, "messages": messages, "stream": False, "max_tokens": 600}
+        try:
+            resp = requests.post(endpoint, json=payload, headers=_get_headers(), timeout=timeout)
+            resp.raise_for_status()
+            choice = resp.json().get("choices", [{}])[0]
+            return (choice.get("message", {}).get("content") or "").strip()
+        except Exception as e:
+            raise RuntimeError(f"{provider.upper()} text call failed: {e}")
+
+    endpoint = f"{url}/api/chat"
     payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
 
     try:
@@ -457,7 +834,7 @@ def _stream_openai(
         payload["tool_choice"] = "auto"
 
     try:
-        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
+        with requests.post(endpoint, json=payload, headers=_get_headers(), timeout=timeout, stream=True) as resp:
             resp.raise_for_status()
             full_content = ""
             buf          = ""
@@ -543,18 +920,30 @@ def _stream_openai(
     except requests.exceptions.Timeout:
         raise RuntimeError("OpenAI-compatible stream timed out.")
     except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        _is_transient = status in (429, 503) or any(
+            k in str(e).lower() for k in ("rate", "quota", "unavailable", "high demand", "overloaded")
+        )
+        if _is_transient:
+            print(f"[LLM] Groq/OpenAI stream {status} - falling back to Ollama llama3.2 stream, Sir...")
+            # Yield from Ollama stream as fallback
+            fallback = _ollama_fallback_call(messages, tools, timeout)
+            yield {"type": "sentence", "text": fallback["content"]}
+            yield {"type": "done", "content": fallback["content"], "tool_calls": fallback["tool_calls"]}
+            return
         raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
     except Exception as e:
         raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
 
 
 def call_llm_stream(
-    messages: list,
+    messages: list | str,
     tools:    list | None = None,
     timeout:  int = 120,
+    system_prompt: str | None = None,
 ) -> Generator[dict, None, None]:
     """
-    Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
+    Streaming chat request.  Routes to Ollama or OpenAI/Groq compatible backend.
 
     Yields:
         {"type": "sentence", "text": str}   — each complete sentence as it arrives
@@ -563,8 +952,18 @@ def call_llm_stream(
     Sentences are split on [.!?] + whitespace so TTS can start immediately.
     Tool calls always appear in the final "done" event.
     """
+    if isinstance(messages, str):
+        msg_list = []
+        if system_prompt:
+            msg_list.append({"role": "system", "content": system_prompt})
+        msg_list.append({"role": "user", "content": messages})
+        messages = msg_list
+
     provider = get_llm_provider()
-    if provider == "openai":
+    if provider == "claude":
+        yield from _stream_claude(messages, tools, timeout)
+        return
+    if provider in ("openai", "groq"):
         yield from _stream_openai(messages, tools, timeout)
         return
 

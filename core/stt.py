@@ -9,6 +9,42 @@ import os
 import re
 import sys
 import numpy as np
+import speech_recognition as sr
+
+# Safe PyAudio stream cleanup patch for Windows
+try:
+    _orig_mic_exit = sr.Microphone.__exit__
+    def _safe_mic_exit(self, exc_type, exc_value, traceback):
+        if getattr(self, "stream", None) is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = None
+    sr.Microphone.__exit__ = _safe_mic_exit
+except Exception:
+    pass
+
+# Ensure UTF-8 console output for Tamil and Indic Unicode on Windows
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+_orig_print = print
+def print(*args, **kwargs):
+    """Safe print wrapper preventing UnicodeEncodeError on Windows codepages."""
+    try:
+        _orig_print(*args, **kwargs)
+    except UnicodeEncodeError:
+        try:
+            cleaned = [str(a).encode("ascii", errors="replace").decode("ascii") for a in args]
+            _orig_print(*cleaned, **kwargs)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _setup_cuda_dll_paths() -> None:
@@ -184,6 +220,67 @@ class VoskSTT:
         return partial.get("partial", ""), False
 
 
+class GroqWhisperSTT:
+    """
+    Ultra-fast cloud Speech-to-Text transcription powered by Groq's Whisper API.
+    Transcribes float32 mono 16 kHz numpy audio arrays in ~150-300ms using whisper-large-v3-turbo.
+    """
+
+    def __init__(self, api_key: str | None = None, model: str = "whisper-large-v3-turbo", language: str | None = None):
+        self._api_key = api_key or os.environ.get("GROQ_API_KEY", "")
+        if not self._api_key:
+            try:
+                from pathlib import Path
+                base_dir = Path(__file__).resolve().parent.parent
+                cfg_path = base_dir / "config" / "api_keys.json"
+                if cfg_path.exists():
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    self._api_key = cfg.get("groq_api_key", "")
+            except Exception:
+                pass
+        self._model = model
+        self._language = None if (not language or language.strip().lower() == "auto") else language.strip().lower()
+        print(f"[STT] GroqWhisperSTT initialized (model: {self._model})")
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Transcribe a float32 mono 16 kHz numpy array using Groq Whisper API."""
+        if not self._api_key:
+            raise RuntimeError("Groq API key not configured for GroqWhisperSTT.")
+
+        import io
+        import wave
+        import requests
+
+        int16_audio = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(int16_audio.tobytes())
+        buf.seek(0)
+
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        files = {"file": ("audio.wav", buf.read(), "audio/wav")}
+        data = {"model": self._model}
+        if self._language:
+            data["language"] = self._language
+
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return (resp.json().get("text") or "").strip()
+        except Exception as e:
+            print(f"[STT] Groq Whisper error: {e}")
+            raise
+
+
 DEFAULT_WAKE_WORDS = [
     "hey jarvis",
     "jarvis",
@@ -199,23 +296,85 @@ DEFAULT_WAKE_WORDS = [
     "jarves",
     "jaavis",
     "charvis",
+    # Tamil wake words
     "ஜார்விஸ்",
+    "ஹேய் ஜார்விஸ்",
+    "ஹே ஜார்விஸ்",
+    "ஏய் ஜார்விஸ்",
+    "ஹாய் ஜார்விஸ்",
+    "ஹலோ ஜார்விஸ்",
+    "வணக்கம் ஜார்விஸ்",
+    "சார்விஸ்",
+    "ஜார்விசு",
 ]
 
+_WAKE_PFX = r"(?:hey|hi|hello|ok|okay|yo|a|eh|ஹேய்|ஹே|ஏய்|ஹாய்|ஹலோ|வணக்கம்|சரி)"
+_WAKE_NAMES = r"(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis|ஜார்விஸ்|சார்விஸ்|ஜார்விசு)"
+
 _WAKE_REGEX = re.compile(
-    r"^\s*(?:(?:hey|hi|hello|ok|okay|yo|a|eh)\s+)?(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis|ஜார்விஸ்)(?:\b|\s|$)[\s,:\-–]*(.*)$",
+    rf"^\s*(?:{_WAKE_PFX}\s+)?{_WAKE_NAMES}(?:\b|\s|[\s,:\-–]|$)+(.*)$",
     re.IGNORECASE | re.UNICODE
 )
 
 _EMBEDDED_WAKE_REGEX = re.compile(
-    r"(?:(?:\b|^)(?:hey|hi|hello|ok|okay|yo|a|eh)\s+)?(?:jarvis|jarvius|jarviz|jarves|jaavis|jarwiss?|charvis|ஜார்விஸ்)(?:\b|\s|$)",
+    rf"(?:(?:\b|^)(?:{_WAKE_PFX})\s+)?{_WAKE_NAMES}(?:\b|\s|[\s,:\-–]|$)",
     re.IGNORECASE | re.UNICODE
 )
+
+TAMIL_CHAR_RE = re.compile(r"[\u0B80-\u0BFF]")
+
+
+def select_bilingual_result(
+    res_ta: str | None,
+    res_en: str | None,
+    custom_wake_words: list[str] | None = None
+) -> str | None:
+    """
+    Intelligently select the most accurate transcription between Tamil (ta-IN)
+    and English (en-IN) recognition candidates for Tanglish and bilingual voice commands.
+    """
+    if not res_ta and not res_en:
+        return None
+    if not res_ta:
+        return res_en
+    if not res_en:
+        return res_ta
+
+    # 1. Wake word match preference
+    is_wake_ta, _, _ = parse_wake_word(res_ta, custom_wake_words)
+    is_wake_en, _, _ = parse_wake_word(res_en, custom_wake_words)
+
+    if is_wake_ta and not is_wake_en:
+        return res_ta
+    if is_wake_en and not is_wake_ta:
+        return res_en
+
+    # 2. Check for Tamil script
+    has_tamil = bool(TAMIL_CHAR_RE.search(res_ta))
+
+    # 3. Check for standard English query words
+    common_english = {
+        "what", "who", "where", "how", "when", "why", "is", "the", "time", "date",
+        "open", "close", "play", "pause", "stop", "next", "volume", "system", "battery",
+        "weather", "search", "mute", "unmute"
+    }
+    en_words = set(re.findall(r"\w+", res_en.lower()))
+    en_match_count = len(en_words.intersection(common_english))
+
+    # If pure English standard command and not Tanglish particles:
+    if en_match_count >= 2 and not any(k in res_en.lower() for k in ("pannu", "pannunga", "enna", "epdi", "irukka", "vanakkam")):
+        return res_en
+
+    # If Tamil script present, prefer Tamil
+    if has_tamil:
+        return res_ta
+
+    return res_en or res_ta
 
 
 def parse_wake_word(text: str, custom_wake_words: list[str] | None = None) -> tuple[bool, str, str]:
     """
-    Check if speech input begins with or contains a wake word (e.g. 'Hey Jarvis', 'Jarvis', 'Hey Jarvius').
+    Check if speech input begins with or contains a wake word (e.g. 'Hey Jarvis', 'Jarvis', 'Hey Jarvius', 'ஜார்விஸ்').
     Returns:
         (is_wake_detected: bool, remaining_command: str, matched_wake_phrase: str)
     """
@@ -273,39 +432,138 @@ class LiveSpeechListener:
 
     @staticmethod
     def get_preferred_mic_index() -> int | None:
-        """Find the most suitable working microphone index on Windows."""
+        """
+        Find the most suitable working microphone index on Windows.
+        Prioritizes the Windows default recording device (which reflects user's
+        Sound Settings selection), then Bluetooth/headset devices, then arrays.
+        Skips raw driver-path-only bthhfenum entries (no clean device name).
+
+        Bluetooth coherence: when the TTS output is already routed to a BT
+        device (headphones/headset), the matching BT input device gets a large
+        coherence bonus so it beats the laptop's default internal mic.
+        """
         try:
             import sounddevice as sd
+            import speech_recognition as sr
+
+            default_dev = None
+            try:
+                d_in = sd.default.device[0]
+                if d_in is not None and d_in >= 0:
+                    default_dev = int(d_in)
+            except Exception:
+                pass
+
+            # ── Detect active BT output device name for coherence bonus ──
+            active_bt_out_name = ""
+            try:
+                d_out_idx = sd.default.device[1]
+                if d_out_idx is not None and d_out_idx >= 0:
+                    d_out = sd.query_devices(int(d_out_idx))
+                    out_name = d_out.get("name", "").lower()
+                    if any(k in out_name for k in (
+                        "headphones", "headset", "bluetooth", "p47", "m19",
+                        "boult", "airbass", "zyio"
+                    )):
+                        active_bt_out_name = out_name
+                        print(f"[STT] BT output active: '{d_out.get('name', '')}' — will boost matching BT mic")
+            except Exception:
+                pass
+
             devices = sd.query_devices()
             candidates = []
             for i, d in enumerate(devices):
-                if d.get("max_input_channels", 0) > 0:
-                    name = d.get("name", "").lower()
-                    score = 0
-                    if any(k in name for k in ("headset", "hands-free", "m19", "p47", "boult", "airbass", "zyio", "bluetooth")):
-                        score += 30
-                    elif "usb" in name:
-                        score += 20
-                    elif "microphone array" in name or "array" in name:
-                        score += 10
-                    elif "mic" in name:
-                        score += 8
-                    if "mapper" in name or "primary" in name:
-                        score -= 5
-                    candidates.append((score, i, d["name"]))
+                if d.get("max_input_channels", 0) <= 0:
+                    continue
+
+                raw_name = d.get("name", "")
+                name = raw_name.lower()
+
+                # Skip entries whose name IS the raw BT driver path (no friendly name)
+                # e.g. "@System32\drivers\bthhfenum.sys,#2;%1 Hands-Free%0\n;(P47)"
+                if "system32" in name and "bthhfenum" in name:
+                    continue
+
+                api_name = ""
+                try:
+                    api_name = sd.query_hostapis(d.get("hostapi", 0)).get("name", "").lower()
+                except Exception:
+                    pass
+
+                # WDM-KS causes static on BT — skip entirely
+                if "wdm-ks" in api_name:
+                    continue
+
+                score = 0
+
+                # ── Highest priority: Windows default recording device ──
+                if default_dev is not None and i == default_dev:
+                    score += 100
+
+                # ── Device type scoring ──
+                is_bt_headset = any(k in name for k in (
+                    "headset", "hands-free", "p47", "m19",
+                    "boult", "airbass", "zyio", "bluetooth"
+                ))
+                if is_bt_headset:
+                    score += 30   # Bluetooth headsets get strong bonus
+                elif "usb" in name:
+                    score += 35
+                elif "microphone array" in name or "array" in name:
+                    score += 28
+                elif "mic" in name:
+                    score += 15
+
+                # ── Bluetooth coherence bonus ──
+                # When TTS output is on a BT device, give BT mic a large bonus
+                # so it wins over the default internal laptop mic.
+                if is_bt_headset and active_bt_out_name:
+                    # Extra boost if device name tokens overlap (same headset model).
+                    # Must be large enough to beat default laptop mic (default+array+mme = 138).
+                    out_tokens = set(active_bt_out_name.split())
+                    in_tokens  = set(name.split())
+                    if out_tokens & in_tokens:
+                        score += 120  # same model — strong coherence match (beats default mic)
+                    else:
+                        score += 80   # different BT device but still BT coherence
+
+                # Penalise generic mapper/primary aliases (they shadow real devices)
+                if "mapper" in name or "primary" in name:
+                    score -= 20
+
+                # ── Audio API quality scoring ──
+                if "wasapi" in api_name:
+                    score += 15
+                elif "mme" in api_name:
+                    score += 10
+                elif "directsound" in api_name:
+                    score += 5
+
+                candidates.append((score, i, raw_name))
+
             candidates.sort(key=lambda x: x[0], reverse=True)
-            if candidates and candidates[0][0] > 0:
-                print(f"[STT] Auto-selected preferred audio device [{candidates[0][1]}]: {candidates[0][2]}")
-                return candidates[0][1]
+
+            for score, idx, name in candidates:
+                if score <= 0:
+                    continue
+                # Verify SpeechRecognition can actually open this device
+                try:
+                    probe = sr.Microphone(device_index=idx)
+                    with probe as src:
+                        if src and getattr(src, "stream", None) is not None:
+                            print(f"[STT] Auto-selected preferred audio device [{idx}]: {name}")
+                            return idx
+                except Exception:
+                    continue
         except Exception:
             pass
         return None
 
     def __init__(
         self,
-        device_index: int | None = None,
-        language: str = "en-IN",
-        pause_threshold: float = 0.8,
+        device_index: int | str | None = None,
+        language: str = "bilingual",
+        pause_threshold: float = 1.0,
         phrase_time_limit: float = 15.0,
         acoustic_cooldown: float = 0.6,
         continuous_mode: bool = True,
@@ -324,12 +582,21 @@ class LiveSpeechListener:
     ):
         import speech_recognition as sr
         self.sr = sr
-        # Auto-resolve preferred microphone index if none provided
-        if device_index is None:
+        # Auto-resolve preferred microphone index if none or 'auto' provided
+        if device_index is None or str(device_index).lower() in ("auto", "none", "null", ""):
             self.device_index = self.get_preferred_mic_index()
         else:
-            self.device_index = device_index
-        self.language = language or "en-IN"
+            try:
+                import sounddevice as sd
+                idx_int = int(device_index)
+                d_info = sd.query_devices(idx_int)
+                if d_info.get("max_input_channels", 0) > 0:
+                    self.device_index = idx_int
+                else:
+                    self.device_index = self.get_preferred_mic_index()
+            except Exception:
+                self.device_index = self.get_preferred_mic_index()
+        self.language = language or "bilingual"
         self.pause_threshold = pause_threshold
         self.phrase_time_limit = phrase_time_limit
         self.acoustic_cooldown = acoustic_cooldown
@@ -352,9 +619,9 @@ class LiveSpeechListener:
         self.recognizer.dynamic_energy_adjustment_damping = 0.15
         self.recognizer.dynamic_energy_ratio = 1.5
         self.recognizer.pause_threshold = self.pause_threshold
-        self.recognizer.phrase_threshold = 0.3
-        self.recognizer.non_speaking_duration = 0.5
-        self.recognizer.energy_threshold = 300.0
+        self.recognizer.phrase_threshold = min(0.15, self.pause_threshold)
+        self.recognizer.non_speaking_duration = min(0.3, self.pause_threshold)
+        self.recognizer.energy_threshold = 250.0
 
         self.microphone = None
         self._thread = None
@@ -401,6 +668,52 @@ class LiveSpeechListener:
                 return True
         return False
 
+    def transcribe_audio(self, audio) -> str | None:
+        """
+        Transcribe audio using Google STT with bilingual Tanglish and Tamil support.
+        In 'bilingual' or 'auto' mode, queries ta-IN and en-IN concurrently and
+        picks the best candidate without delay.
+        """
+        lang = (self.language or "bilingual").strip().lower()
+
+        if lang in ("bilingual", "auto", "ta+en", "en+ta", "tanglish"):
+            import concurrent.futures
+
+            def _try(l: str) -> str | None:
+                try:
+                    return self.recognizer.recognize_google(audio, language=l).strip()
+                except Exception:
+                    return None
+
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    f_ta = executor.submit(_try, "ta-IN")
+                    f_en = executor.submit(_try, "en-IN")
+                    res_ta = f_ta.result(timeout=10.0)
+                    res_en = f_en.result(timeout=10.0)
+                return select_bilingual_result(res_ta, res_en, self.wake_words)
+            except Exception:
+                res_ta = _try("ta-IN")
+                res_en = _try("en-IN")
+                return select_bilingual_result(res_ta, res_en, self.wake_words)
+
+        elif lang == "ta-in" or "ta" in lang:
+            try:
+                return self.recognizer.recognize_google(audio, language="ta-IN").strip()
+            except Exception:
+                try:
+                    return self.recognizer.recognize_google(audio, language="en-IN").strip()
+                except Exception:
+                    return None
+        else:
+            try:
+                return self.recognizer.recognize_google(audio, language=self.language).strip()
+            except Exception:
+                try:
+                    return self.recognizer.recognize_google(audio, language="ta-IN").strip()
+                except Exception:
+                    return None
+
     def start(self):
         """Initialize microphone and start background listening thread."""
         if self._running:
@@ -418,38 +731,199 @@ class LiveSpeechListener:
     def _run_loop(self):
         import time
 
+        _broken_devices: dict[int | None, float] = {}   # device_index -> blacklist_until timestamp
+        _BLACKLIST_SECS = 60.0
+
+        def _get_working_device_order() -> list[int | None]:
+            """Return candidate device indices to try, prioritized by system default and quality."""
+            candidates: list[int | None] = []
+            # Always try the explicitly configured device first (if not blacklisted)
+            if self.device_index is not None and self.device_index not in _broken_devices:
+                candidates.append(self.device_index)
+
+            # System default recording device
+            default_dev = None
+            try:
+                import sounddevice as sd
+                d_in = sd.default.device[0]
+                if d_in is not None and d_in >= 0 and d_in not in _broken_devices:
+                    default_dev = int(d_in)
+                    if default_dev not in candidates:
+                        candidates.append(default_dev)
+            except Exception:
+                pass
+
+            if None not in candidates and None not in _broken_devices:
+                candidates.append(None)
+
+            # Add all other available input devices ranked by reliability
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+
+                # Detect active BT output for coherence scoring
+                _active_bt_out = ""
+                try:
+                    d_out_idx = sd.default.device[1]
+                    if d_out_idx is not None and d_out_idx >= 0:
+                        _d_out = sd.query_devices(int(d_out_idx))
+                        _out_name = _d_out.get("name", "").lower()
+                        if any(k in _out_name for k in (
+                            "headphones", "headset", "bluetooth", "p47", "m19",
+                            "boult", "airbass", "zyio"
+                        )):
+                            _active_bt_out = _out_name
+                except Exception:
+                    pass
+
+                ranked = []
+                for i, d in enumerate(devices):
+                    if d.get("max_input_channels", 0) > 0:
+                        name = d.get("name", "").lower()
+                        if "bthhfenum" in name or "system32" in name:
+                            continue
+                        score = 0
+                        if default_dev is not None and i == default_dev:
+                            score += 100
+                        is_bt = any(k in name for k in ("headset", "hands-free", "m19", "p47", "boult", "airbass", "zyio", "bluetooth"))
+                        if is_bt:
+                            score += 25
+                        elif "usb" in name:
+                            score += 35
+                        elif "microphone array" in name or "array" in name:
+                            score += 30
+                        elif "mic" in name:
+                            score += 15
+                        if "mapper" in name or "primary" in name:
+                            score -= 20
+
+                        # BT coherence bonus in reconnect loop
+                        if is_bt and _active_bt_out:
+                            out_tokens = set(_active_bt_out.split())
+                            in_tokens  = set(name.split())
+                            if out_tokens & in_tokens:
+                                score += 120  # same model wins over default laptop mic
+                            else:
+                                score += 80
+
+                        api_name = sd.query_hostapis(d.get("hostapi", 0)).get("name", "").lower()
+                        if "wdm-ks" in api_name:
+                            continue
+                        if "wasapi" in api_name:
+                            score += 15
+                        elif "mme" in api_name:
+                            score += 10
+                        elif "directsound" in api_name:
+                            score += 5
+
+                        ranked.append((score, i))
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                for _, idx in ranked:
+                    if idx not in candidates:
+                        candidates.append(idx)
+            except Exception:
+                pass
+            return candidates
+
+        def _probe_device(idx: int | None) -> bool:
+            """Return True only if the device opens cleanly and its stream is not None."""
+            now = time.time()
+            if idx in _broken_devices and now < _broken_devices[idx]:
+                return False   # still blacklisted
+            try:
+                probe_mic = self.sr.Microphone(device_index=idx)
+                with probe_mic as probe_src:
+                    if probe_src is None or getattr(probe_src, "stream", None) is None:
+                        _broken_devices[idx] = now + _BLACKLIST_SECS
+                        return False
+                return True
+            except Exception:
+                _broken_devices[idx] = now + _BLACKLIST_SECS
+                return False
+
         # Outer reconnection loop for device resilience
         while self._running:
-            try:
-                mic = self.sr.Microphone(device_index=self.device_index)
-            except Exception as e:
-                print(f"[STT] Failed to create microphone source (device={self.device_index}): {e}")
+            # Find first working device
+            _SENTINEL = object()
+            working_device = _SENTINEL  # will be replaced with int | None once a working device is found
+            for candidate in _get_working_device_order():
+                if _probe_device(candidate):
+                    working_device = candidate
+                    break
+
+            if working_device is _SENTINEL:
+                print("[STT] No working microphone found. Retrying in 3s…")
                 if self.log_fn:
-                    self.log_fn(f"ERR: Voice-to-Text mic init error: {e}")
+                    self.log_fn("WARN: No working microphone detected. Retrying in 3s…")
+                time.sleep(3.0)
+                continue
+
+            if working_device != self.device_index:
+                names = []
                 try:
-                    mic = self.sr.Microphone()
-                except Exception as e2:
-                    print(f"[STT] Default microphone also failed: {e2}")
-                    time.sleep(2.0)
-                    continue
+                    names = self.sr.Microphone.list_microphone_names()
+                except Exception:
+                    pass
+                dev_name = names[working_device] if working_device is not None and working_device < len(names) else "default"
+                print(f"[STT] Falling back to device [{working_device}]: {dev_name}")
+                if self.log_fn:
+                    self.log_fn(f"SYS: STT using fallback mic [{working_device}]: {dev_name}")
+
+            try:
+                mic = self.sr.Microphone(device_index=working_device)
+            except Exception as e:
+                print(f"[STT] Failed to create microphone (device={working_device}): {e}")
+                _broken_devices[working_device] = time.time() + _BLACKLIST_SECS
+                time.sleep(1.0)
+                continue
 
             try:
                 with mic as source:
+                    # Guard: stream must not be None
+                    if source is None or getattr(source, "stream", None) is None:
+                        print(f"[STT] Device [{working_device}] opened but stream is None — blacklisting.")
+                        _broken_devices[working_device] = time.time() + _BLACKLIST_SECS
+                        time.sleep(1.0)
+                        continue
+
                     self.microphone = source
-                    print(f"[STT] Calibrating microphone for ambient noise (device={self.device_index})...")
-                    self.recognizer.adjust_for_ambient_noise(source, duration=0.8)
-                    # Enforce safe minimum threshold (never drop below 250 to avoid infinite listening buffer on quiet noise floor)
-                    self.recognizer.energy_threshold = max(250.0, min(self.recognizer.energy_threshold, 1800.0))
-                    self.recognizer.dynamic_energy_threshold = False
-                    print(f"[STT] Mic calibrated. Energy threshold: {self.recognizer.energy_threshold:.1f}")
+                    print(f"[STT] Calibrating microphone for ambient noise (device={working_device})...")
+                    # Clear any stream startup click/pop before calibration
+                    try:
+                        source.stream.read(source.CHUNK)
+                    except Exception:
+                        pass
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.35)
+                    raw_thresh = self.recognizer.energy_threshold
+                    is_bt_mic = any(k in str(dev_name).lower() for k in ("headset", "bluetooth", "p47", "m19", "hands-free", "boult", "airbass"))
+                    if is_bt_mic:
+                        safe_threshold = max(45.0, min(raw_thresh * 1.1 + 8.0, 240.0))
+                    else:
+                        safe_threshold = max(65.0, min(raw_thresh * 1.15 + 10.0, 360.0))
+                    self.recognizer.energy_threshold = safe_threshold
+                    self.recognizer.dynamic_energy_threshold = True
+                    self.recognizer.dynamic_energy_adjustment_damping = 0.12
+                    self.recognizer.dynamic_energy_ratio = 1.25
+                    self.recognizer.pause_threshold = min(self.pause_threshold, 0.45)
+                    self.recognizer.phrase_threshold = 0.1
+                    self.recognizer.non_speaking_duration = 0.25
+                    print(f"[STT] Mic calibrated ({'Bluetooth' if is_bt_mic else 'Standard'}). Raw: {raw_thresh:.1f} -> Fast threshold: {self.recognizer.energy_threshold:.1f}")
                     if self.log_fn:
-                        self.log_fn(f"SYS: Voice-to-Text mic calibrated (energy threshold: {self.recognizer.energy_threshold:.0f}).")
+                        self.log_fn(f"SYS: Voice-to-Text mic calibrated (energy threshold: {self.recognizer.energy_threshold:.0f}, pause: {self.recognizer.pause_threshold:.2f}s).")
 
                     # Inner continuous capture loop with persistent stream
                     while self._running:
-                        # Prevent threshold from drifting below safe floor
-                        if self.recognizer.energy_threshold < 200.0:
-                            self.recognizer.energy_threshold = 250.0
+                        # Validate stream still alive
+                        if getattr(source, "stream", None) is None:
+                            print("[STT] Stream became None mid-session — reconnecting.")
+                            break
+
+                        # Keep energy_threshold bounded near the calibrated floor so mic never becomes deaf
+                        max_allowed_threshold = max(safe_threshold * 1.8, 420.0)
+                        if self.recognizer.energy_threshold > max_allowed_threshold:
+                            self.recognizer.energy_threshold = safe_threshold
+                        elif self.recognizer.energy_threshold < safe_threshold:
+                            self.recognizer.energy_threshold = safe_threshold
                         speaking = bool(self.is_speaking_fn and self.is_speaking_fn())
                         muted = bool(self.is_muted_fn and self.is_muted_fn())
 
@@ -478,15 +952,7 @@ class LiveSpeechListener:
                                     time.sleep(0.05)
                                     continue
 
-                                try:
-                                    text = self.recognizer.recognize_google(audio, language=self.language).strip()
-                                except Exception:
-                                    try:
-                                        alt_lang = "ta-IN" if self.language in ("en-IN", "en-US") else "en-IN"
-                                        text = self.recognizer.recognize_google(audio, language=alt_lang).strip()
-                                    except Exception:
-                                        continue
-
+                                text = self.transcribe_audio(audio)
                                 if not text:
                                     continue
 
@@ -512,7 +978,7 @@ class LiveSpeechListener:
 
                                 if self.on_command:
                                     try:
-                                        self.on_command(text, {"speaker": "Sir", "confidence": 1.0})
+                                        self.on_command(text, {"speaker": "Sir", "confidence": 1.0, "full_text": text})
                                     except Exception as err:
                                         print(f"[STT] Error executing barge-in command: {err}")
                             else:
@@ -524,10 +990,10 @@ class LiveSpeechListener:
                             continue
 
                         try:
-                            # Listen on the open stream with 1.0s timeout to remain responsive to mute/speaking
+                            # Listen on the open stream with 1.5s timeout to remain responsive to mute/speaking
                             audio = self.recognizer.listen(
                                 source,
-                                timeout=1.0,
+                                timeout=1.5,
                                 phrase_time_limit=self.phrase_time_limit
                             )
                         except self.sr.WaitTimeoutError:
@@ -563,34 +1029,12 @@ class LiveSpeechListener:
                             except Exception:
                                 pass
 
-                        # Convert speech to text with bilingual fallback
-                        text = None
-                        try:
-                            text = self.recognizer.recognize_google(audio, language=self.language).strip()
-                        except self.sr.UnknownValueError:
-                            # Try alternate language (Tamil ta-IN or English en-IN)
-                            alt_lang = "ta-IN" if self.language in ("en-IN", "en-US") else "en-IN"
-                            try:
-                                text = self.recognizer.recognize_google(audio, language=alt_lang).strip()
-                            except Exception:
-                                text = None
-                            if not text:
-                                print("[STT] 👂 Sound detected, but words were not clear (ambient sound or whisper).")
-                                continue
-                        except self.sr.RequestError as e:
-                            # Retry with alternate locale if service error
-                            alt_lang = "ta-IN" if self.language in ("en-IN", "en-US") else "en-US"
-                            try:
-                                text = self.recognizer.recognize_google(audio, language=alt_lang).strip()
-                            except Exception:
-                                text = None
-                            if not text:
-                                print(f"[STT] Recognition service error: {e}")
-                                if self.log_fn:
-                                    self.log_fn(f"ERR: STT network error: {e}")
-                                continue
-                        except Exception as e:
-                            print(f"[STT] Speech conversion exception: {e}")
+                        # Convert speech to text with bilingual Tanglish and Tamil support
+                        text = self.transcribe_audio(audio)
+                        # Reset energy threshold to calibrated baseline to prevent drift
+                        self.recognizer.energy_threshold = safe_threshold
+                        if not text:
+                            print("[STT] 👂 Sound detected, but words were not clear (ambient sound or whisper).")
                             continue
 
                         if text:
@@ -606,10 +1050,15 @@ class LiveSpeechListener:
                                 print(f"[STT] ⚡ Wake word triggered: '{matched_wake}' (awake for {self.wake_timeout:.1f}s)")
                                 if self.on_wake:
                                     try:
-                                        self.on_wake(matched_wake, bool(cmd_part))
+                                        self.on_wake(matched_wake, bool(cmd_part), text)
                                     except TypeError:
                                         try:
-                                            self.on_wake(matched_wake)
+                                            self.on_wake(matched_wake, bool(cmd_part))
+                                        except TypeError:
+                                            try:
+                                                self.on_wake(matched_wake)
+                                            except Exception as err:
+                                                print(f"[STT] Error invoking on_wake: {err}")
                                         except Exception as err:
                                             print(f"[STT] Error invoking on_wake: {err}")
                                     except Exception as err:
@@ -624,6 +1073,7 @@ class LiveSpeechListener:
                                                 "confidence": confidence,
                                                 "wake_word": matched_wake,
                                                 "inlined": True,
+                                                "full_text": text,
                                             })
                                         except Exception as err:
                                             print(f"[STT] Error invoking on_command callback: {err}")
@@ -641,6 +1091,7 @@ class LiveSpeechListener:
                                             "speaker": speaker_name,
                                             "confidence": confidence,
                                             "follow_up": True,
+                                            "full_text": text,
                                         })
                                     except Exception as err:
                                         print(f"[STT] Error invoking on_command callback: {err}")
@@ -663,9 +1114,13 @@ class LiveSpeechListener:
             except Exception as e:
                 if not self._running:
                     break
-                print(f"[STT] Microphone device stream error: {e}. Reconnecting in 1s...")
-                if self.log_fn:
-                    self.log_fn(f"WARN: Mic stream disconnected ({e}), re-opening in 1s...")
+                err_str = str(e)
+                # Suppress the noisy NoneType stream error — it's a known Bluetooth device disconnect
+                if "NoneType" in err_str and "close" in err_str:
+                    _broken_devices[working_device] = time.time() + _BLACKLIST_SECS
+                    print(f"[STT] Device [{working_device}] stream closed unexpectedly — blacklisted for {int(_BLACKLIST_SECS)}s, switching device.")
+                else:
+                    print(f"[STT] Microphone device stream error: {e}. Reconnecting in 1s...")
+                    if self.log_fn:
+                        self.log_fn(f"WARN: Mic stream disconnected ({e}), re-opening in 1s...")
                 time.sleep(1.0)
-
-

@@ -22,6 +22,20 @@ import numpy as np
 import sounddevice as sd
 import speech_recognition as sr
 
+# Safe PyAudio stream cleanup patch for Windows
+try:
+    _orig_mic_exit = sr.Microphone.__exit__
+    def _safe_mic_exit(self, exc_type, exc_value, traceback):
+        if getattr(self, "stream", None) is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = None
+    sr.Microphone.__exit__ = _safe_mic_exit
+except Exception:
+    pass
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
@@ -79,6 +93,14 @@ def run_diagnostics():
     best_dev_idx = None
     best_peak = 0
 
+    default_in_idx = None
+    try:
+        d_in = sd.default.device[0]
+        if d_in is not None and d_in >= 0:
+            default_in_idx = int(d_in)
+    except Exception:
+        pass
+
     for idx in input_indices:
         d = devices[idx]
         d_name = d.get("name", "Unknown")
@@ -101,17 +123,38 @@ def run_diagnostics():
 
         # Scoring
         score = 0
+        if default_in_idx is not None and idx == default_in_idx:
+            score += 100
+
         name_lower = d_name.lower()
-        if "microphone array" in name_lower or "array" in name_lower:
+        if "bthhfenum" in name_lower or "system32" in name_lower:
+            score -= 100
+        elif any(k in name_lower for k in ("headset", "hands-free", "m19", "p47", "boult", "airbass", "zyio", "bluetooth")):
+            score += 25
+        elif "usb" in name_lower:
+            score += 35
+        elif "microphone array" in name_lower or "array" in name_lower:
+            score += 30
+        elif "mic" in name_lower:
             score += 15
-        elif "headset" in name_lower or "usb" in name_lower or "mic" in name_lower:
-            score += 10
         if "mapper" in name_lower or "primary" in name_lower:
-            score -= 5
+            score -= 20
+
+        host_api_lower = host_api.lower()
+        if "wdm-ks" in host_api_lower:
+            continue
+        if "wasapi" in host_api_lower:
+            score += 15
+        elif "mme" in host_api_lower:
+            score += 10
+        elif "directsound" in host_api_lower:
+            score += 5
 
         # Factor in actual audio peak
-        if peak > 10:
-            score += 20
+        if peak > 500:
+            score += 25
+        elif peak > 10:
+            score += 15
 
         d_info = {
             "index": idx,
@@ -130,7 +173,7 @@ def run_diagnostics():
         print(f"  [{idx:2d}] {d_name[:35]:35s} | API: {host_api:12s} | Peak: {peak:5d} | Signal: [{signal_bar:20s}]")
 
     # Pick highest scoring working device
-    valid_devices = [d for d in report["devices"] if "Err" not in d["status"]]
+    valid_devices = [d for d in report["devices"] if "Err" not in d["status"] and d["score"] > 0]
     if valid_devices:
         valid_devices.sort(key=lambda x: x["score"], reverse=True)
         best_dev_idx = valid_devices[0]["index"]
@@ -150,18 +193,19 @@ def run_diagnostics():
         r = sr.Recognizer()
         print(f"  - Initial threshold:  {r.energy_threshold}")
         with sr.Microphone(device_index=best_dev_idx) as source:
-            r.adjust_for_ambient_noise(source, duration=0.8)
+            try:
+                source.stream.read(source.CHUNK)
+            except Exception:
+                pass
+            r.adjust_for_ambient_noise(source, duration=0.6)
             raw_threshold = r.energy_threshold
             print(f"  - Ambient calibrated: {raw_threshold:.1f}")
 
-            # Apply JARVIS safety clamp
-            clamped = max(250.0, min(raw_threshold, 1800.0))
+            # Safe human speech floor: speech is 150-600, so clamp ambient between 70.0 and 380.0
+            clamped = max(70.0, min(raw_threshold * 1.2 + 15.0, 380.0))
             r.energy_threshold = clamped
             report["calibrated_threshold"] = clamped
-            print(f"  - Clamped threshold:  {clamped:.1f} (Safe human speech floor)")
-
-            if raw_threshold < 200.0:
-                print("  - [FIX APPLIED] Raw threshold was too low (<200) — successfully clamped to 250.")
+            print(f"  - Safe speech threshold:  {clamped:.1f}")
     except Exception as e:
         print(f"  - SpeechRecognition mic error: {e}")
 
@@ -223,9 +267,10 @@ def run_diagnostics():
     if best_dev_idx is not None and CONFIG_PATH.exists():
         try:
             cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            cfg["mic_device_index"] = best_dev_idx
+            save_val = "auto" if (default_in_idx is not None and best_dev_idx == default_in_idx) else best_dev_idx
+            cfg["mic_device_index"] = save_val
             CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
-            print(f"\n[Saved] Updated config/api_keys.json with mic_device_index = {best_dev_idx}")
+            print(f"\n[Saved] Updated config/api_keys.json with mic_device_index = {save_val} (Device [{best_dev_idx}])")
         except Exception as e:
             print(f"\n[Notice] Could not update config: {e}")
 

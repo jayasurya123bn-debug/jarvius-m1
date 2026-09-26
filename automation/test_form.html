@@ -1,0 +1,32 @@
+
+        <!DOCTYPE html>
+        <html>
+        <head><title>JARVIS Automation Test Quiz & Form</title></head>
+        <body style="font-family: sans-serif; padding: 20px;">
+            <h2>JARVIS Automation Verification Form</h2>
+            <div class="question">
+                <p><strong>Question 1: What is the capital of Tamil Nadu?</strong></p>
+                <label for="capital_ans">Your Answer:</label>
+                <input type="text" id="capital_ans" name="capital" placeholder="Enter capital name">
+            </div>
+            <div class="question" style="margin-top: 15px;">
+                <label for="user_email">Your Email Address:</label>
+                <input type="email" id="user_email" name="email" placeholder="name@example.com">
+            </div>
+            <div class="question" style="margin-top: 15px;">
+                <label for="feedback_msg">Feedback Message:</label>
+                <textarea id="feedback_msg" name="message" placeholder="Type comments here"></textarea>
+            </div>
+            <div class="question" style="margin-top: 15px;">
+                <label for="priority_level">Priority:</label>
+                <select id="priority_level" name="priority">
+                    <option value="low">Low Priority</option>
+                    <option value="high" selected>High Priority</option>
+                </select>
+            </div>
+            <div style="margin-top: 20px;">
+                <button type="submit" id="submit_btn">Submit Answers</button>
+            </div>
+        </body>
+        </html>
+        

@@ -399,11 +399,79 @@ def _handle_trending(parameters: dict, player, speak) -> str:
 
     return result
 
+
+def _handle_next_song(parameters: dict, player=None, speak=None) -> str:
+    """
+    Sends Shift + N keyboard shortcut to advance to the next song/video on YouTube.
+    Supports:
+    1. Active Playwright browser session if running YouTube.
+    2. PyAutoGUI hotkey('shift', 'n') if installed.
+    3. Windows OS native keybd_event (VK_SHIFT + 'N') fallback.
+    """
+    if player:
+        player.write_log("[YouTube] Skipping to next song via Shift + N")
+    print("[YouTube] [Next] Next song requested -> Sending Shift + N shortcut")
+
+    pressed = False
+
+    # 1. Try via Playwright active browser session
+    try:
+        from actions.browser_control import _registry
+        for b_name in ("chrome", "edge", "brave", "firefox"):
+            if b_name in _registry._sessions:
+                sess = _registry._sessions[b_name]
+                if sess._page and not sess._page.is_closed():
+                    url = sess._page.url.lower()
+                    if "youtube.com" in url or "youtu.be" in url:
+                        sess.run(sess._page.keyboard.press("Shift+N"))
+                        pressed = True
+                        print("[YouTube] Sent Shift+N via Playwright page session")
+                        break
+    except Exception as e:
+        print(f"[YouTube] Note on Playwright hotkey attempt: {e}")
+
+    # 2. Try via PyAutoGUI
+    if not pressed and _PYAUTOGUI:
+        try:
+            pyautogui.hotkey('shift', 'n')
+            pressed = True
+            print("[YouTube] Sent Shift+N via PyAutoGUI")
+        except Exception as e:
+            print(f"[YouTube] PyAutoGUI hotkey error: {e}")
+
+    # 3. Windows Native ctypes keybd_event fallback (works system-wide)
+    if not pressed and is_windows():
+        try:
+            import ctypes
+            VK_SHIFT = 0x10
+            VK_N = 0x4E
+            KEYEVENTF_KEYUP = 0x0002
+            # Key down Shift, key down N
+            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_N, 0, 0, 0)
+            time.sleep(0.05)
+            # Key up N, key up Shift
+            ctypes.windll.user32.keybd_event(VK_N, 0, KEYEVENTF_KEYUP, 0)
+            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+            pressed = True
+            print("[YouTube] Sent Shift+N via Windows keybd_event")
+        except Exception as e:
+            print(f"[YouTube] Windows keybd_event error: {e}")
+
+    msg = "Skipped to next YouTube song (Shift + N), Sir."
+    if speak:
+        speak(msg)
+    return msg
+
+
 _ACTION_MAP = {
-    "play":      _handle_play,
-    "summarize": _handle_summarize,
-    "get_info":  _handle_get_info,
-    "trending":  _handle_trending,
+    "play":       _handle_play,
+    "next":       _handle_next_song,
+    "next_song":  _handle_next_song,
+    "next_video": _handle_next_song,
+    "summarize":  _handle_summarize,
+    "get_info":   _handle_get_info,
+    "trending":   _handle_trending,
 }
 
 
@@ -419,13 +487,13 @@ def youtube_video(
 
     if player:
         player.write_log(f"[YouTube] Action: {action}")
-    print(f"[YouTube] ▶️  Action: {action}  Params: {params}")
+    print(f"[YouTube] [Action] Action: {action}  Params: {params}")
 
     handler = _ACTION_MAP.get(action)
     if handler is None:
         return (
             f"Unknown YouTube action: '{action}'. "
-            "Available: play, summarize, get_info, trending."
+            "Available: play, next, summarize, get_info, trending."
         )
 
     try:
