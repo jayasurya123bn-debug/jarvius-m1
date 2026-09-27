@@ -368,28 +368,70 @@ class HudCanvas(QWidget):
         self._blink_tick = 0
         self._particles: list[list[float]] = []
         self._face_px: QPixmap | None = None
+        self._raw_bg_px: QPixmap | None = None
+        self._cached_bg_px: QPixmap | None = None
+        self._cached_bg_size: tuple[int, int] = (0, 0)
+        self._cached_face_scaled: QPixmap | None = None
+        self._cached_face_size: int = 0
+
         self._load_face(face_path)
 
+        # Performance optimization for low-end PC: check low_spec_mode
+        cfg = _read_full_config()
+        self._is_low_spec = cfg.get("low_spec_mode", True)
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        self._tmr.start(33 if self._is_low_spec else 16)
 
     def _load_face(self, path: str):
-        try:
-            from PIL import Image, ImageDraw
-            import io
-            img = Image.open(path).convert("RGBA")
-            sz  = min(img.size)
-            img = img.resize((sz, sz), Image.LANCZOS)
-            mk  = Image.new("L", (sz, sz), 0)
-            ImageDraw.Draw(mk).ellipse((2, 2, sz - 2, sz - 2), fill=255)
-            img.putalpha(mk)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            px = QPixmap(); px.loadFromData(buf.getvalue())
-            self._face_px = px
-        except Exception:
-            self._face_px = None
+        # 1. First check if optimized pre-generated assets exist on disk
+        p = Path(path)
+        base = p.parent if p.is_file() else BASE_DIR
+        cropped_path = base / "face_cropped.png"
+        bg_path = base / "face_bg.jpg"
+
+        if cropped_path.exists():
+            self._face_px = QPixmap(str(cropped_path))
+        elif Path("face_cropped.png").exists():
+            self._face_px = QPixmap("face_cropped.png")
+
+        if bg_path.exists():
+            self._raw_bg_px = QPixmap(str(bg_path))
+        elif Path("face_bg.jpg").exists():
+            self._raw_bg_px = QPixmap("face_bg.jpg")
+
+        if (self._face_px is None or self._raw_bg_px is None) and (Path(path).exists() or Path("face.png").exists()):
+            src_path = str(path) if Path(path).exists() else "face.png"
+            try:
+                from PIL import Image, ImageDraw, ImageEnhance
+                import io
+
+                orig = Image.open(src_path)
+                # 1. Circular Arc Reactor center crop
+                rgba = orig.convert("RGBA")
+                sz = min(rgba.size)
+                left = (rgba.width - sz) // 2
+                top = (rgba.height - sz) // 2
+                crop = rgba.crop((left, top, left + sz, top + sz)).resize((512, 512), Image.LANCZOS)
+                mk = Image.new("L", (512, 512), 0)
+                ImageDraw.Draw(mk).ellipse((4, 4, 508, 508), fill=255)
+                crop.putalpha(mk)
+                buf1 = io.BytesIO()
+                crop.save(buf1, format="PNG")
+                px = QPixmap()
+                px.loadFromData(buf1.getvalue())
+                self._face_px = px
+
+                # 2. Ambient HUD Background wallpaper
+                rgb = orig.convert("RGB")
+                dimmed = ImageEnhance.Brightness(rgb).enhance(0.38)
+                buf2 = io.BytesIO()
+                dimmed.save(buf2, format="JPEG", quality=85)
+                bg_px = QPixmap()
+                bg_px.loadFromData(buf2.getvalue())
+                self._raw_bg_px = bg_px
+            except Exception as e:
+                print(f"[HUD] Asset load exception: {e}")
 
     def _step(self):
         self._tick += 1
@@ -424,7 +466,9 @@ class HudCanvas(QWidget):
         if len(self._pulses) < 3 and random.random() < (0.07 if self.speaking else 0.025):
             self._pulses.append(0.0)
 
-        if self.speaking and random.random() < 0.28:
+        # Particle limiter for low-end PC (no lag)
+        max_particles = 10 if self._is_low_spec else 25
+        if self.speaking and len(self._particles) < max_particles and random.random() < 0.22:
             cx, cy = self.width() / 2, self.height() / 2
             ang = random.uniform(0, 2 * math.pi)
             r_s = fw * 0.28
@@ -447,7 +491,29 @@ class HudCanvas(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), qcol(C.BG))
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        W, H = self.width(), self.height()
+        cx, cy = W / 2, H / 2
+        fw = min(W, H)
+
+        # 1. Draw cached ambient wallpaper background (ultra-fast, 0 lag!)
+        if self._raw_bg_px:
+            if self._cached_bg_size != (W, H) or self._cached_bg_px is None:
+                self._cached_bg_px = self._raw_bg_px.scaled(
+                    W, H,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._cached_bg_size = (W, H)
+            if self._cached_bg_px:
+                bx = int((W - self._cached_bg_px.width()) / 2)
+                by = int((H - self._cached_bg_px.height()) / 2)
+                p.drawPixmap(bx, by, self._cached_bg_px)
+                # Subtle dark vignette overlay for high HUD contrast
+                p.fillRect(self.rect(), QColor(1, 8, 16, 120))
+        else:
+            p.fillRect(self.rect(), qcol(C.BG))
 
         W, H = self.width(), self.height()
         cx, cy = W / 2, H / 2
@@ -534,13 +600,17 @@ class HudCanvas(QWidget):
 
         # face
         if self._face_px:
-            fsz    = int(fw * 0.62 * self._scale)
-            scaled = self._face_px.scaled(
-                fsz, fsz,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
+            fsz = int(fw * 0.54 * self._scale)
+            # Quantize & cache scaled face so we don't scale every single frame on low-end CPUs!
+            if abs(fsz - self._cached_face_size) > 2 or self._cached_face_scaled is None:
+                self._cached_face_scaled = self._face_px.scaled(
+                    fsz, fsz,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._cached_face_size = fsz
+            if self._cached_face_scaled:
+                p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), self._cached_face_scaled)
         else:
             orb_r = int(fw * 0.27 * self._scale)
             oc    = (200, 0, 50) if self.muted else (0, 60, 110)
