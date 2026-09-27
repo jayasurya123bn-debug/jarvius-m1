@@ -905,9 +905,9 @@ class LiveSpeechListener:
                     self.recognizer.dynamic_energy_threshold = True
                     self.recognizer.dynamic_energy_adjustment_damping = 0.12
                     self.recognizer.dynamic_energy_ratio = 1.25
-                    self.recognizer.pause_threshold = min(self.pause_threshold, 0.45)
-                    self.recognizer.phrase_threshold = 0.1
-                    self.recognizer.non_speaking_duration = 0.25
+                    self.recognizer.pause_threshold = self.pause_threshold
+                    self.recognizer.phrase_threshold = min(0.25, self.pause_threshold)
+                    self.recognizer.non_speaking_duration = min(0.65, self.pause_threshold)
                     print(f"[STT] Mic calibrated ({'Bluetooth' if is_bt_mic else 'Standard'}). Raw: {raw_thresh:.1f} -> Fast threshold: {self.recognizer.energy_threshold:.1f}")
                     if self.log_fn:
                         self.log_fn(f"SYS: Voice-to-Text mic calibrated (energy threshold: {self.recognizer.energy_threshold:.0f}, pause: {self.recognizer.pause_threshold:.2f}s).")
@@ -938,53 +938,56 @@ class LiveSpeechListener:
                             time.sleep(0.08)
                             continue
 
-                        # Voice barge-in: If JARVIS is speaking and barge-in is enabled, listen for Sir's speech
+                        # Voice barge-in: If JARVIS is speaking and barge-in is enabled,
+                        # monitor mic stream in real time so JARVIS IMMEDIATELY STOPS the moment Sir speaks!
                         if speaking:
                             if self.voice_barge_in:
-                                try:
-                                    audio = self.recognizer.listen(
-                                        source,
-                                        timeout=0.5,
-                                        phrase_time_limit=8.0
-                                    )
-                                except self.sr.WaitTimeoutError:
-                                    continue
-                                except Exception:
-                                    time.sleep(0.05)
-                                    continue
-
-                                text = self.transcribe_audio(audio)
-                                if not text:
-                                    continue
-
-                                # Filter out self-hearing echo through speakers
-                                speaking_text = (self.get_speaking_text_fn() if self.get_speaking_text_fn else "")
-                                if self._is_echo(text, speaking_text):
-                                    continue
-
-                                # Voice barge-in confirmed!
-                                print(f"[STT] ✋ Voice Barge-in triggered by Sir: '{text}'")
-                                if self.log_fn:
-                                    self.log_fn(f"SYS: Voice interruption triggered ('{text}').")
-
-                                if self.on_interrupt:
+                                consecutive_speech = 0
+                                import numpy as _np
+                                while self._running and bool(self.is_speaking_fn and self.is_speaking_fn()):
+                                    if getattr(source, "stream", None) is None:
+                                        break
                                     try:
-                                        self.on_interrupt()
-                                    except Exception as err:
-                                        print(f"[STT] Error invoking on_interrupt: {err}")
+                                        raw_chunk = source.stream.read(source.CHUNK, exception_on_overflow=False)
+                                    except Exception:
+                                        time.sleep(0.02)
+                                        continue
 
-                                t_clean = text.lower().strip().rstrip(".!?")
-                                if t_clean in self.INTERRUPT_KEYWORDS:
+                                    if not raw_chunk:
+                                        time.sleep(0.01)
+                                        continue
+
+                                    # Fast RMS energy calculation
+                                    arr = _np.frombuffer(raw_chunk, dtype=_np.int16)
+                                    rms = float(_np.sqrt(_np.mean(arr.astype(_np.float64)**2))) if len(arr) > 0 else 0.0
+
+                                    # Threshold: for Bluetooth/headset (e.g. P47), there is 0 speaker bleed, so any speech energy is Sir
+                                    # For laptop speakers, set threshold slightly higher than acoustic bleed
+                                    interrupt_thresh = (safe_threshold * 1.15) if is_bt_mic else max(safe_threshold * 1.6, 260.0)
+
+                                    if rms > interrupt_thresh:
+                                        consecutive_speech += 1
+                                        # When Sir speaks for 2 consecutive chunks (~100-120ms), trigger INSTANT STOP!
+                                        if consecutive_speech >= 2:
+                                            print(f"[STT] ✋ Sir voice detected mid-speech (RMS: {rms:.1f} > {interrupt_thresh:.1f})! Stopping JARVIS immediately...")
+                                            if self.log_fn:
+                                                self.log_fn("SYS: ✋ Sir started speaking — JARVIS stopped.")
+                                            if self.on_interrupt:
+                                                try:
+                                                    self.on_interrupt()
+                                                except Exception as err:
+                                                    print(f"[STT] Error invoking on_interrupt: {err}")
+                                            break
+                                    else:
+                                        consecutive_speech = 0
+
+                                # Re-check speaking state: if interrupted, speaking is now False!
+                                speaking = bool(self.is_speaking_fn and self.is_speaking_fn())
+                                if speaking:
                                     continue
-
-                                if self.on_command:
-                                    try:
-                                        self.on_command(text, {"speaker": "Sir", "confidence": 1.0, "full_text": text})
-                                    except Exception as err:
-                                        print(f"[STT] Error executing barge-in command: {err}")
                             else:
                                 time.sleep(0.08)
-                            continue
+                                continue
 
                         if time.time() < self._cooldown_until:
                             time.sleep(0.05)

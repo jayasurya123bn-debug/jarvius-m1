@@ -4150,7 +4150,7 @@ class MainWindow(QMainWindow):
             cfg["claude_api_key"] = claude_key.strip()
             cfg["anthropic_api_key"] = claude_key.strip()
         cfg["tts_rate"] = "+20%"
-        cfg["voice_pause_threshold"] = 0.45
+        cfg["voice_pause_threshold"] = 1.3
         cfg["low_spec_mode"] = True
 
         API_FILE.write_text(

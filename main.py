@@ -741,6 +741,9 @@ class JarvisLive:
         """Speak text immediately using local EdgeTTS (for Tamil/English) or pyttsx3 in a background thread."""
         def _do():
             with self._tts_lock:
+                if self._interrupted:
+                    self._interrupted = False
+                    return
                 try:
                     self.set_speaking(True)
                     # Try neural EdgeTTS first: high quality, streams directly to Bluetooth/default output via sounddevice
@@ -755,6 +758,9 @@ class JarvisLive:
                         return
                     except Exception as edge_err:
                         print(f"[TTS Local] EdgeTTS failed: {edge_err}, falling back to pyttsx3")
+
+                    if self._interrupted:
+                        return
 
                     import pyttsx3
                     engine = pyttsx3.init()
@@ -1284,9 +1290,17 @@ class JarvisLive:
                 self._live_speech_listener.trigger_cooldown()
 
     def interrupt(self) -> None:
-        """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+        """Stop JARVIS mid-speech: stop soundcard immediately, drain queued audio and open mic immediately."""
         self._interrupted = True
         self._current_speech_text = ""
+        # 1. Immediately kill any audio playing through soundcard (EdgeTTS, local TTS, sounddevice)
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
+
+        # 2. Drain any pending streaming audio chunks
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -1301,7 +1315,7 @@ class JarvisLive:
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
-        self.ui.write_log("SYS: Interrupted — listening...")
+        self.ui.write_log("SYS: ✋ Interrupted — JARVIS stopped, listening...")
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -1331,9 +1345,9 @@ class JarvisLive:
             self._voice_security_mode = str(_cfg.get("voice_security_mode", "smart")).lower().strip()
             self._voice_threshold = float(_cfg.get("voice_match_threshold", 0.72))
             self._voice_continuous_listening = bool(_cfg.get("voice_continuous_listening", True))
-            self._voice_pause_threshold = float(_cfg.get("voice_pause_threshold", 0.8))
+            self._voice_pause_threshold = float(_cfg.get("voice_pause_threshold", 1.3))
             self._voice_phrase_time_limit = float(_cfg.get("voice_phrase_time_limit", 15.0))
-            self._voice_acoustic_cooldown = float(_cfg.get("voice_acoustic_cooldown", 0.6))
+            self._voice_acoustic_cooldown = float(_cfg.get("voice_acoustic_cooldown", 0.3))
             self._voice_barge_in = bool(_cfg.get("voice_barge_in", True))
             self._wake_word_enabled = bool(_cfg.get("wake_word_enabled", True))
             self._wake_timeout = float(_cfg.get("wake_timeout", 10.0))
@@ -1353,7 +1367,7 @@ class JarvisLive:
             self._voice_security_mode = "smart"
             self._voice_threshold = 0.72
             self._voice_continuous_listening = True
-            self._voice_pause_threshold = 1.0
+            self._voice_pause_threshold = 1.3
             self._voice_phrase_time_limit = 15.0
             self._voice_acoustic_cooldown = 0.6
             self._voice_barge_in = True
@@ -1715,9 +1729,9 @@ class JarvisLive:
         listener = LiveSpeechListener(
             device_index=self._mic_device,
             language=getattr(self, "_stt_language", "bilingual"),
-            pause_threshold=getattr(self, "_voice_pause_threshold", 0.45),
-            phrase_time_limit=getattr(self, "_voice_phrase_time_limit", 10.0),
-            acoustic_cooldown=getattr(self, "_voice_acoustic_cooldown", 0.3),
+            pause_threshold=getattr(self, "_voice_pause_threshold", 1.3),
+            phrase_time_limit=getattr(self, "_voice_phrase_time_limit", 15.0),
+            acoustic_cooldown=getattr(self, "_voice_acoustic_cooldown", 0.2),
             continuous_mode=getattr(self, "_voice_continuous_listening", False),
             voice_barge_in=getattr(self, "_voice_barge_in", True),
             wake_word_enabled=getattr(self, "_wake_word_enabled", True),
