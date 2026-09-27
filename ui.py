@@ -497,7 +497,7 @@ class HudCanvas(QWidget):
         cx, cy = W / 2, H / 2
         fw = min(W, H)
 
-        # 1. Draw cached ambient wallpaper background (ultra-fast, 0 lag!)
+        # 1. Ambient Wallpaper Background
         if self._raw_bg_px:
             if self._cached_bg_size != (W, H) or self._cached_bg_px is None:
                 self._cached_bg_px = self._raw_bg_px.scaled(
@@ -510,108 +510,99 @@ class HudCanvas(QWidget):
                 bx = int((W - self._cached_bg_px.width()) / 2)
                 by = int((H - self._cached_bg_px.height()) / 2)
                 p.drawPixmap(bx, by, self._cached_bg_px)
-                # Subtle dark vignette overlay for high HUD contrast
-                p.fillRect(self.rect(), QColor(1, 8, 16, 120))
+                # Subtle dark vignette for high contrast depth
+                p.fillRect(self.rect(), QColor(1, 8, 16, 65))
+
+            # Dynamic Core Bloom Pulse (living reactor core)
+            core_r = fw * 0.16 * self._scale
+            glow = QRadialGradient(cx, cy, core_r * 1.6)
+            glow_alpha = 190 if self.speaking else (100 if self.state == "LISTENING" else 55)
+            glow.setColorAt(0.0, QColor(0, 229, 255, glow_alpha))
+            glow.setColorAt(0.45, QColor(0, 160, 240, int(glow_alpha * 0.45)))
+            glow.setColorAt(1.0, QColor(0, 20, 60, 0))
+            p.setBrush(QBrush(glow))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QRectF(cx - core_r * 1.6, cy - core_r * 1.6, core_r * 3.2, core_r * 3.2))
+
+            # Expanding audio shockwaves when speaking
+            if self.speaking:
+                for pr in self._pulses:
+                    a = max(0, int(180 * (1.0 - pr / (fw * 0.55))))
+                    if a > 0:
+                        col = qcol(C.PRI, a)
+                        p.setPen(QPen(col, 1.5))
+                        p.setBrush(Qt.BrushStyle.NoBrush)
+                        p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
+
+            # Holographic Radar Sweep around outer dial
+            sr = fw * 0.45
+            srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
+            sweep_a = 150 if self.speaking else 85
+            p.setPen(QPen(qcol(C.PRI, sweep_a), 2.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(srect, int(self._scan * 16), int(55 * 16))
+            p.setPen(QPen(qcol(C.ACC, sweep_a // 2), 1.2))
+            p.drawArc(srect, int(self._scan2 * 16), int(30 * 16))
+
         else:
+            # Fallback pure procedural vector HUD when no wallpaper image is loaded
             p.fillRect(self.rect(), qcol(C.BG))
 
-        W, H = self.width(), self.height()
-        cx, cy = W / 2, H / 2
-        fw = min(W, H)
+            # grid dots
+            p.setPen(QPen(qcol(C.PRI_GHO), 1))
+            for x in range(0, W, 48):
+                for y in range(0, H, 48):
+                    p.drawPoint(x, y)
 
-        # grid dots
-        p.setPen(QPen(qcol(C.PRI_GHO), 1))
-        for x in range(0, W, 48):
-            for y in range(0, H, 48):
-                p.drawPoint(x, y)
+            r_face = fw * 0.31
+            for i in range(10):
+                r   = r_face * (1.8 - i * 0.08)
+                frc = 1.0 - i / 10
+                a   = max(0, min(255, int(self._halo * 0.085 * frc)))
+                col = qcol(C.MUTED_C if self.muted else C.PRI, a)
+                p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
 
-        r_face = fw * 0.31
+            for pr in self._pulses:
+                a   = max(0, int(230 * (1.0 - pr / (fw * 0.74))))
+                col = qcol(C.MUTED_C if self.muted else C.PRI, a)
+                p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
 
-        # halo glow
-        for i in range(10):
-            r   = r_face * (1.8 - i * 0.08)
-            frc = 1.0 - i / 10
-            a   = max(0, min(255, int(self._halo * 0.085 * frc)))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+            for idx, (r_frac, w_r, arc_l, gap) in enumerate(
+                [(0.48, 3, 115, 78), (0.40, 2, 78, 55), (0.32, 1, 56, 40)]
+            ):
+                ring_r = fw * r_frac
+                base   = self._rings[idx]
+                a_val  = max(0, min(255, int(self._halo * (1.0 - idx * 0.18))))
+                col    = qcol(C.MUTED_C if self.muted else C.PRI, a_val)
+                p.setPen(QPen(col, w_r)); p.setBrush(Qt.BrushStyle.NoBrush)
+                angle = base
+                rect  = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
+                while angle < base + 360:
+                    p.drawArc(rect, int(angle * 16), int(arc_l * 16))
+                    angle += arc_l + gap
 
-        # pulse rings
-        for pr in self._pulses:
-            a   = max(0, int(230 * (1.0 - pr / (fw * 0.74))))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
+            sr = fw * 0.50
+            sa = min(255, int(self._halo * 1.5))
+            ex = 75 if self.speaking else 44
+            p.setPen(QPen(qcol(C.MUTED_C if self.muted else C.PRI, sa), 2.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
+            p.drawArc(srect, int(self._scan * 16), int(ex * 16))
+            p.setPen(QPen(qcol(C.ACC, sa // 2), 1.5))
+            p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
 
-        # spinning arc rings
-        for idx, (r_frac, w_r, arc_l, gap) in enumerate(
-            [(0.48, 3, 115, 78), (0.40, 2, 78, 55), (0.32, 1, 56, 40)]
-        ):
-            ring_r = fw * r_frac
-            base   = self._rings[idx]
-            a_val  = max(0, min(255, int(self._halo * (1.0 - idx * 0.18))))
-            col    = qcol(C.MUTED_C if self.muted else C.PRI, a_val)
-            p.setPen(QPen(col, w_r)); p.setBrush(Qt.BrushStyle.NoBrush)
-            angle = base
-            rect  = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
-            while angle < base + 360:
-                p.drawArc(rect, int(angle * 16), int(arc_l * 16))
-                angle += arc_l + gap
-
-        # scanners
-        sr = fw * 0.50
-        sa = min(255, int(self._halo * 1.5))
-        ex = 75 if self.speaking else 44
-        p.setPen(QPen(qcol(C.MUTED_C if self.muted else C.PRI, sa), 2.5))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
-        p.drawArc(srect, int(self._scan * 16), int(ex * 16))
-        p.setPen(QPen(qcol(C.ACC, sa // 2), 1.5))
-        p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
-
-        # tick marks
-        t_out, t_in = fw * 0.497, fw * 0.474
-        p.setPen(QPen(qcol(C.PRI, 140), 1))
-        for deg in range(0, 360, 10):
-            rad = math.radians(deg)
-            inn = t_in if deg % 30 == 0 else t_in + 6
-            p.drawLine(
-                QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
-                QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
-            )
-
-        # crosshair
-        ch_r, gap_h = fw * 0.51, fw * 0.16
-        p.setPen(QPen(qcol(C.PRI, int(self._halo * 0.5)), 1))
-        p.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
-        p.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
-        p.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
-        p.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
-
-        # corner brackets
-        bl = 24
-        bc = qcol(C.PRI, 210)
-        hl, hr = cx - fw // 2, cx + fw // 2
-        ht, hb = cy - fw // 2, cy + fw // 2
-        p.setPen(QPen(bc, 2))
-        for bx, by, dx, dy in [(hl,ht,1,1),(hr,ht,-1,1),(hl,hb,1,-1),(hr,hb,-1,-1)]:
-            p.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
-            p.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
-
-        # face
-        if self._face_px:
-            fsz = int(fw * 0.54 * self._scale)
-            # Quantize & cache scaled face so we don't scale every single frame on low-end CPUs!
-            if abs(fsz - self._cached_face_size) > 2 or self._cached_face_scaled is None:
-                self._cached_face_scaled = self._face_px.scaled(
-                    fsz, fsz,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
+            t_out, t_in = fw * 0.497, fw * 0.474
+            p.setPen(QPen(qcol(C.PRI, 140), 1))
+            for deg in range(0, 360, 10):
+                rad = math.radians(deg)
+                inn = t_in if deg % 30 == 0 else t_in + 6
+                p.drawLine(
+                    QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
+                    QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
                 )
-                self._cached_face_size = fsz
-            if self._cached_face_scaled:
-                p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), self._cached_face_scaled)
-        else:
+
             orb_r = int(fw * 0.27 * self._scale)
             oc    = (200, 0, 50) if self.muted else (0, 60, 110)
             for i in range(8, 0, -1):
@@ -622,19 +613,29 @@ class HudCanvas(QWidget):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.drawEllipse(QRectF(cx - r2, cy - r2, r2 * 2, r2 * 2))
             p.setPen(QPen(qcol(C.PRI, min(255, int(self._halo * 2))), 1))
-            p.setFont(QFont("Courier New", 13, QFont.Weight.Bold))
+            p.setFont(QFont("Consolas", 13, QFont.Weight.Bold))
             p.drawText(QRectF(cx - 80, cy - 14, 160, 28),
                        Qt.AlignmentFlag.AlignCenter, self._assistant_name)
 
-        # particles
+        # Tactical corner brackets
+        bl = 24
+        bc = qcol(C.PRI, 180)
+        hl, hr = cx - fw * 0.48, cx + fw * 0.48
+        ht, hb = cy - fw * 0.48, cy + fw * 0.48
+        p.setPen(QPen(bc, 1.5))
+        for bx, by, dx, dy in [(hl,ht,1,1),(hr,ht,-1,1),(hl,hb,1,-1),(hr,hb,-1,-1)]:
+            p.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
+            p.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
+
+        # Floating Energy Particles
         for pt in self._particles:
             a = max(0, min(255, int(pt[4] * 255)))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(qcol(C.PRI, a)))
             p.drawEllipse(QPointF(pt[0], pt[1]), 2.5, 2.5)
 
-        # status text
-        sy = cy + fw * 0.40
+        # Modern Frosted Status Badge
+        sy = cy + fw * 0.36
         if self.muted:
             txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
         elif self.speaking:
@@ -652,24 +653,31 @@ class HudCanvas(QWidget):
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", qcol(C.PRI)
 
-        p.setPen(QPen(col, 1))
-        p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
-        p.drawText(QRectF(0, sy, W, 26), Qt.AlignmentFlag.AlignCenter, txt)
+        badge_w, badge_h = 160, 26
+        badge_rect = QRectF(cx - badge_w / 2, sy, badge_w, badge_h)
+        p.setBrush(QBrush(QColor(1, 14, 24, 215)))
+        p.setPen(QPen(QColor(0, 212, 255, 90), 1))
+        p.drawRoundedRect(badge_rect, 13, 13)
 
-        # waveform
-        wy = sy + 30
-        N, bw = 36, 8
-        wx0 = (W - N * bw) / 2
+        p.setPen(QPen(col, 1))
+        p.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 9, QFont.Weight.Bold))
+        p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, txt)
+
+        # Dynamic Audio Waveform Equalizer
+        wy = sy + 32
+        N, bw = 32, 6
+        spacing = 3
+        wx0 = cx - (N * (bw + spacing) - spacing) / 2
         for i in range(N):
             if self.muted:
                 hgt, cl = 2, qcol(C.MUTED_C)
             elif self.speaking:
-                hgt = random.randint(3, 20)
+                hgt = random.randint(3, 22)
                 cl  = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
             else:
-                hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
+                hgt = int(3 + 2.5 * math.sin(self._tick * 0.08 + i * 0.45))
                 cl  = qcol(C.BORDER_B)
-            p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
+            p.fillRect(QRectF(wx0 + i * (bw + spacing), wy + 16 - hgt, bw, hgt), cl)
 
 class MetricBar(QWidget):
 
@@ -696,34 +704,40 @@ class MetricBar(QWidget):
         p.setPen(QPen(qcol(C.BORDER_A), 1))
         p.drawRoundedRect(QRectF(1, 1, W - 2, H - 2), 4, 4)
 
-        bar_h   = 4
-        bar_y   = H - bar_h - 5
-        bar_w   = W - 12
-        bar_x   = 6
-        fill_w  = int(bar_w * self._value / 100)
+        bar_h  = 4
+        bar_y  = H - bar_h - 6
+        bar_w  = W - 16
+        bar_x  = 8
+        fill_w = int(bar_w * self._value / 100)
 
         p.setBrush(QBrush(qcol(C.BAR_BG)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
 
         if self._value > 85:
-            bar_col = qcol(C.RED)
+            c1, c2 = QColor(255, 60, 90), QColor(255, 20, 60)
         elif self._value > 65:
-            bar_col = qcol(C.ACC)
+            c1, c2 = QColor(255, 170, 0), QColor(255, 110, 0)
         else:
-            bar_col = qcol(self._color)
+            c1, c2 = QColor(0, 212, 255), QColor(0, 255, 200)
 
         if fill_w > 0:
-            p.setBrush(QBrush(bar_col))
+            grad = QLinearGradient(bar_x, bar_y, bar_x + fill_w, bar_y)
+            grad.setColorAt(0.0, c1)
+            grad.setColorAt(1.0, c2)
+            p.setBrush(QBrush(grad))
             p.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 2, 2)
+            p.setBrush(QBrush(QColor(255, 255, 255, 220)))
+            p.drawEllipse(QRectF(bar_x + fill_w - 3, bar_y - 1, 6, 6))
 
-        p.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        p.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 8, QFont.Weight.Bold))
         p.setPen(QPen(qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(8, 5, 50, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._label)
+        p.drawText(QRectF(8, 4, 50, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._label)
 
-        p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(0, 4, W - 6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
+        p.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 9, QFont.Weight.Bold))
+        val_col = c2 if self._text != "--" else qcol(C.TEXT_DIM)
+        p.setPen(QPen(val_col, 1))
+        p.drawText(QRectF(0, 4, W - 8, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
 
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
@@ -3467,8 +3481,9 @@ class MainWindow(QMainWindow):
         w.setObjectName("ContentPanel")
         w.setStyleSheet(f"""
             QWidget#ContentPanel {{
-                background: {C.PANEL};
-                border-top: 1px solid {C.BORDER_B};
+                background: rgba(1, 14, 24, 0.94);
+                border-top: 1px solid {C.PRI};
+                border-radius: 6px 6px 0 0;
             }}
         """)
         w.hide()
@@ -3481,12 +3496,12 @@ class MainWindow(QMainWindow):
         hdr = QHBoxLayout(); hdr.setSpacing(6)
 
         dot = QLabel("◈")
-        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setFont(QFont("Segoe UI Emoji" if _OS == "Windows" else "Courier New", 9, QFont.Weight.Bold))
         dot.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         hdr.addWidget(dot)
 
         self._content_title_lbl = QLabel("BRIEFING")
-        self._content_title_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._content_title_lbl.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 8, QFont.Weight.Bold))
         self._content_title_lbl.setStyleSheet(
             f"color: {C.PRI}; background: transparent; letter-spacing: 1px;"
         )
@@ -3494,20 +3509,20 @@ class MainWindow(QMainWindow):
         hdr.addStretch()
 
         self._content_ts_lbl = QLabel("")
-        self._content_ts_lbl.setFont(QFont("Courier New", 7))
+        self._content_ts_lbl.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 7))
         self._content_ts_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         hdr.addWidget(self._content_ts_lbl)
 
         dismiss = QPushButton("DISMISS  ✕")
-        dismiss.setFont(QFont("Courier New", 7))
-        dismiss.setFixedHeight(18)
+        dismiss.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 7, QFont.Weight.Bold))
+        dismiss.setFixedHeight(20)
         dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
         dismiss.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 2px; padding: 0 5px;
+                background: rgba(0, 20, 35, 0.8); color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER_B}; border-radius: 3px; padding: 0 8px;
             }}
-            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+            QPushButton:hover {{ color: #ffffff; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
         """)
         dismiss.clicked.connect(w.hide)
         hdr.addWidget(dismiss)
@@ -3520,18 +3535,18 @@ class MainWindow(QMainWindow):
         # ── text display ──────────────────────────────────────────────────────
         self._content_display = QTextEdit()
         self._content_display.setReadOnly(True)
-        self._content_display.setFont(QFont("Courier New", 8))
+        self._content_display.setFont(QFont("Consolas" if _OS == "Windows" else "Courier New", 8))
         self._content_display.setMinimumHeight(60)
         self._content_display.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self._content_display.setStyleSheet(f"""
             QTextEdit {{
-                background: {C.DARK};
-                color: {C.TEXT};
+                background: rgba(0, 10, 18, 0.85);
+                color: {C.WHITE};
                 border: 1px solid {C.BORDER};
-                border-radius: 3px;
-                padding: 6px 8px;
+                border-radius: 4px;
+                padding: 6px 10px;
                 selection-background-color: {C.PRI_GHO};
             }}
             QScrollBar:vertical {{
@@ -3561,7 +3576,14 @@ class MainWindow(QMainWindow):
         self._content_panel.show()
         if first_show:
             total = self._center_split.height()
-            self._center_split.setSizes([max(total - 220, 120), 220])
+            self._center_split.setSizes([max(total - 135, 260), 135])
+
+        # Auto-dismiss news/briefing overlay after 25s so it never blocks the HUD permanently
+        if not hasattr(self, "_content_auto_timer"):
+            self._content_auto_timer = QTimer(self)
+            self._content_auto_timer.setSingleShot(True)
+            self._content_auto_timer.timeout.connect(self._content_panel.hide)
+        self._content_auto_timer.start(25000)
 
     def _build_footer(self) -> QWidget:
         w = QWidget()

@@ -858,13 +858,14 @@ class LiveSpeechListener:
                 time.sleep(3.0)
                 continue
 
+            names = []
+            try:
+                names = self.sr.Microphone.list_microphone_names()
+            except Exception:
+                pass
+            dev_name = names[working_device] if (working_device is not None and names and working_device < len(names)) else "default"
+
             if working_device != self.device_index:
-                names = []
-                try:
-                    names = self.sr.Microphone.list_microphone_names()
-                except Exception:
-                    pass
-                dev_name = names[working_device] if working_device is not None and working_device < len(names) else "default"
                 print(f"[STT] Falling back to device [{working_device}]: {dev_name}")
                 if self.log_fn:
                     self.log_fn(f"SYS: STT using fallback mic [{working_device}]: {dev_name}")
