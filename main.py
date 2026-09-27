@@ -87,7 +87,9 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODELS     = [
     "models/gemini-2.5-flash-native-audio-latest",
+    "models/gemini-2.5-flash-native-audio-preview-09-2025",
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-3.8-live",
 ]
 LIVE_MODEL      = LIVE_MODELS[0]
 CHANNELS            = 1
@@ -667,6 +669,7 @@ class JarvisLive:
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
         self._model_index = 0
+        self._switch_count = 0
         self._live_speech_listener = None
 
         # Voice Learning & Speaker Identification (Project VoicePrint)
@@ -1242,13 +1245,13 @@ class JarvisLive:
                 except Exception as e:
                     print(f"[JARVIS] Failed to send client content: {e}")
 
-            # Fallback: Process conversational query via configured LLM (Groq / Ollama)!
+            # Fallback 1: Process conversational query via configured LLM (Groq / Ollama)!
             try:
                 from core.llm_client import call_llm_stream, get_llm_provider
                 provider = get_llm_provider()
                 self.ui.write_log(f"SYS: Processing query via {provider.upper()} LLM...")
                 llm_resp = ""
-                for item in call_llm_stream(text, system_prompt="You are JARVIS, an autonomous assistant. Answer Sir concisely in 1-2 sentences in their language."):
+                for item in call_llm_stream(text, system_prompt="You are JARVIS, Tony Stark's autonomous AI assistant. Always address Sir respectfully. Answer Sir concisely in 1-2 sentences in their language (Tamil, Tanglish, or English)."):
                     if isinstance(item, dict):
                         if item.get("type") == "sentence":
                             llm_resp += item.get("text", "") + " "
@@ -1264,6 +1267,32 @@ class JarvisLive:
                     return
             except Exception as llm_err:
                 print(f"[LLM Fallback] Error: {llm_err}")
+
+            # Fallback 2: Direct Gemini Flash REST generation (instant, no Ollama needed)
+            try:
+                gemini_key = _get_api_key()
+                if gemini_key:
+                    from google import genai as _genai
+                    _c = _genai.Client(api_key=gemini_key)
+                    _prompt = (
+                        "You are JARVIS, Tony Stark's autonomous AI assistant. "
+                        "Always address the user strictly as 'Sir'. "
+                        "Answer Sir concisely in 1-2 sentences in the user's language (Tamil, Tanglish, or English).\n\n"
+                        f"User: {text}"
+                    )
+                    _resp = await asyncio.to_thread(
+                        _c.models.generate_content,
+                        model="gemini-3.8-flash",
+                        contents=_prompt,
+                    )
+                    if _resp and getattr(_resp, "text", None):
+                        ans = _resp.text.strip()
+                        self.ui.write_log(f"JARVIS: {ans}")
+                        self._session_log.append(f"JARVIS: {ans}")
+                        self._speak_local(ans)
+                        return
+            except Exception as _rest_err:
+                print(f"[Gemini REST Fallback] Error: {_rest_err}")
 
             self.ui.write_log("SYS: Gemini session connecting, please wait...")
             self._speak_local("Gemini session is connecting, Sir. Command queued.")
@@ -2310,6 +2339,7 @@ class JarvisLive:
                     print(f"[JARVIS] Connected to {current_model}.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log(f"SYS: JARVIS online ({current_model.split('/')[-1]}).")
+                    self._switch_count = 0
 
                     # Voice biometrics status indicator
                     if getattr(self, "_voice_enabled", False) and self.voice_manager and self.voice_manager.is_enrolled():
@@ -2353,11 +2383,20 @@ class JarvisLive:
 
                 # Model quota, deprecation, or not found error — switch to next fallback model
                 if any(k in err_str.lower() for k in ("1011", "quota", "not_found", "404", "no longer available", "not available", "deprecated")):
+                    self._switch_count = getattr(self, "_switch_count", 0) + 1
                     prev_model = LIVE_MODELS[self._model_index % len(LIVE_MODELS)]
-                    self._model_index += 1
-                    next_model = LIVE_MODELS[self._model_index % len(LIVE_MODELS)]
-                    self.ui.write_log(f"SYS: {prev_model.split('/')[-1]} quota/unavailable — switching to {next_model.split('/')[-1]}.")
-                    await asyncio.sleep(1)
+                    self._model_index = (self._model_index + 1) % len(LIVE_MODELS)
+                    next_model = LIVE_MODELS[self._model_index]
+
+                    if self._switch_count < len(LIVE_MODELS):
+                        self.ui.write_log(f"SYS: {prev_model.split('/')[-1]} busy — switching to {next_model.split('/')[-1]}.")
+                        await asyncio.sleep(2)
+                    else:
+                        # Cycled through all live models: all are rate-limited or busy.
+                        # Back off quietly without flooding logs; conversational REST fallback is ready!
+                        self._switch_count = 0
+                        self.ui.write_log("SYS: Gemini Live audio models busy — backing off 12s. (REST fallback ready)")
+                        await asyncio.sleep(12)
                     continue
 
                 # Enhanced audio features rejected by the server (preview API

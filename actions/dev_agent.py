@@ -39,9 +39,9 @@ MAX_FIX_ATTEMPTS = 5
 
 # Multi-model fallback chain
 MODELS = [
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
+    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-2.5-pro",
 ]
 MODEL_PLANNER = MODELS[0]
 MODEL_WRITER  = MODELS[0]

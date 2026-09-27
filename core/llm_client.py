@@ -52,8 +52,10 @@ _ANTHROPIC_VERSION = "2023-06-01"
 
 
 def get_llm_provider() -> str:
-    """Returns 'ollama', 'openai', 'groq', or 'claude'."""
+    """Returns 'gemini', 'ollama', 'openai', 'groq', or 'claude'."""
     raw = _load_config().get("llm_provider", "ollama").strip().lower()
+    if raw in ("gemini", "google"):
+        return "gemini"
     if raw in ("claude", "anthropic"):
         return "claude"
     if raw == "groq":
@@ -357,6 +359,9 @@ def call_llm(
     url, model = get_llm_settings()
     provider   = get_llm_provider()
 
+    if provider == "gemini":
+        return _gemini_fallback_call(messages, tools, timeout)
+
     if provider == "claude":
         return _call_llm_claude(messages, tools, timeout)
 
@@ -396,17 +401,9 @@ def call_llm(
                 "content":    (msg.get("content") or "").strip(),
                 "tool_calls": tc_list,
             }
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else 0
-            _is_transient = status in (429, 503) or any(
-                k in str(e).lower() for k in ("rate", "quota", "unavailable", "high demand", "overloaded")
-            )
-            if _is_transient:
-                print(f"[LLM] {provider.upper()} {status} - falling back to Ollama llama3.2, Sir...")
-                return _ollama_fallback_call(messages, tools, timeout)
-            raise RuntimeError(f"{provider.upper()} LLM call failed: {e}")
         except Exception as e:
-            raise RuntimeError(f"{provider.upper()} LLM call failed: {e}")
+            print(f"[LLM] {provider.upper()} call failed ({type(e).__name__}: {e}) - falling back to Ollama/Gemini, Sir...")
+            return _ollama_fallback_call(messages, tools, timeout)
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     endpoint = f"{url}/api/chat"
@@ -429,40 +426,9 @@ def call_llm(
             "content":    (msg.get("content") or "").strip(),
             "tool_calls": msg.get("tool_calls") or [],
         }
-    except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] ConnectionError — trying to restart Ollama… ({e})")
-        if ensure_ollama_running():
-            try:
-                resp = requests.post(endpoint, json=payload, timeout=timeout)
-                resp.raise_for_status()
-                data = resp.json()
-                msg  = data.get("message", {})
-                return {
-                    "content":    (msg.get("content") or "").strip(),
-                    "tool_calls": msg.get("tool_calls") or [],
-                }
-            except Exception:
-                pass
-        raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
-            "Make sure Ollama is installed and run: ollama serve"
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Ollama request timed out after 120 s.")
-    except requests.exceptions.HTTPError as e:
-        err_detail = ""
-        try:
-            err_detail = e.response.json().get("error", "")
-        except Exception:
-            err_detail = e.response.text if e.response is not None else ""
-        if e.response is not None and e.response.status_code == 404:
-            print(f"[LLM] HTTP 404 Not Found from {endpoint}: {err_detail or 'Model or endpoint not found'}")
-            raise RuntimeError(f"Ollama HTTP 404 Not Found: {err_detail or f'Model {model} not found'}")
-        print(f"[LLM] HTTPError: {e.response.status_code if e.response else 'unknown'} — {err_detail[:200]}")
-        raise RuntimeError(f"Ollama HTTP error {e.response.status_code if e.response else 'unknown'}: {err_detail or e}")
     except Exception as e:
-        print(f"[LLM] Unexpected error: {type(e).__name__}: {e}")
-        raise RuntimeError(f"LLM call failed: {e}")
+        print(f"[LLM] Ollama call failed ({type(e).__name__}: {e}) — falling back to Gemini REST...")
+        return _gemini_fallback_call(messages, tools, timeout)
 
 
 def _call_llm_claude(
@@ -675,7 +641,7 @@ def _stream_claude(
         raise RuntimeError(f"Claude stream failed: {e}")
 
 
-def _ensure_local_ollama_running(timeout: int = 15) -> bool:
+def _ensure_local_ollama_running(timeout: int = 3) -> bool:
     """Ensure local Ollama service specifically is reachable at http://localhost:11434."""
     health = "http://localhost:11434/api/tags"
 
@@ -715,41 +681,88 @@ def _ensure_local_ollama_running(timeout: int = 15) -> bool:
     return False
 
 
+def _gemini_fallback_call(
+    messages: list,
+    tools:    list | None = None,
+    timeout:  int = 60,
+) -> dict:
+    """
+    Fallback to Gemini REST generate_content (gemini-3.8-flash / gemini-flash-latest).
+    Does not require any local daemon or Ollama setup.
+    """
+    cfg = _load_config()
+    key = cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        raise RuntimeError("No Gemini API key configured for REST fallback.")
+    try:
+        from google import genai
+        client = genai.Client(api_key=key)
+        prompt_parts = []
+        for m in messages:
+            role = m.get("role", "user") if isinstance(m, dict) else "user"
+            content = m.get("content", "") if isinstance(m, dict) else str(m)
+            if role == "system":
+                prompt_parts.append(f"[System Instruction]\n{content}")
+            elif role == "user":
+                prompt_parts.append(f"User: {content}")
+            elif role == "assistant":
+                prompt_parts.append(f"JARVIS: {content}")
+        full_prompt = "\n\n".join(prompt_parts) or "Hello"
+
+        for m_name in ("gemini-3.8-flash", "gemini-flash-latest"):
+            try:
+                resp = client.models.generate_content(
+                    model=m_name,
+                    contents=full_prompt,
+                )
+                if resp and getattr(resp, "text", None):
+                    return {
+                        "content": resp.text.strip(),
+                        "tool_calls": [],
+                    }
+            except Exception as m_err:
+                print(f"[LLM] Gemini model {m_name} fallback failed: {m_err}")
+                continue
+    except Exception as e:
+        print(f"[LLM] Gemini client fallback failed: {e}")
+    raise RuntimeError("Gemini REST fallback failed to generate response.")
+
+
 def _ollama_fallback_call(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
 ) -> dict:
     """
-    Emergency Ollama llama3.2 fallback for when cloud providers (Groq/Gemini)
-    return 429/503. Starts Ollama if not already running.
+    Emergency fallback: tries Ollama llama3.2 first, then seamlessly
+    falls back to cloud Gemini REST generate_content if Ollama is not installed/running.
     """
     ollama_url   = "http://localhost:11434"
     ollama_model = "llama3.2"
-    print(f"[LLM] [FALLBACK] Ollama fallback active - using {ollama_model}")
-    if not _ensure_local_ollama_running():
-        raise RuntimeError(
-            "Cloud LLM returned 503/429 AND Ollama is not available. "
-            "Install Ollama from https://ollama.com and run: ollama pull llama3.2"
-        )
-    endpoint = f"{ollama_url}/api/chat"
-    payload: dict = {
-        "model":      ollama_model,
-        "messages":   messages,
-        "stream":     False,
-        "keep_alive": -1,
-        "options":    {"num_predict": 150, "num_gpu": 99},
-    }
-    if tools:
-        payload["tools"] = tools
-    resp = requests.post(endpoint, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    msg  = data.get("message", {})
-    return {
-        "content":    (msg.get("content") or "").strip(),
-        "tool_calls": msg.get("tool_calls") or [],
-    }
+    try:
+        if _ensure_local_ollama_running(timeout=2):
+            endpoint = f"{ollama_url}/api/chat"
+            payload: dict = {
+                "model":      ollama_model,
+                "messages":   messages,
+                "stream":     False,
+                "keep_alive": -1,
+                "options":    {"num_predict": 150, "num_gpu": 99},
+            }
+            if tools:
+                payload["tools"] = tools
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            msg  = data.get("message", {})
+            return {
+                "content":    (msg.get("content") or "").strip(),
+                "tool_calls": msg.get("tool_calls") or [],
+            }
+    except Exception as e:
+        print(f"[LLM] Ollama fallback unavailable ({e}) — falling back to Gemini REST...")
+
+    return _gemini_fallback_call(messages, tools, timeout)
 
 
 def call_llm_text(
@@ -912,27 +925,17 @@ def _stream_openai(
                 "tool_calls": tool_calls,
             }
 
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            f"Cannot reach OpenAI-compatible server at {url}.\n"
-            "Make sure LM Studio / LocalAI / Jan is running and the server is started."
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("OpenAI-compatible stream timed out.")
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code if e.response is not None else 0
-        _is_transient = status in (429, 503) or any(
-            k in str(e).lower() for k in ("rate", "quota", "unavailable", "high demand", "overloaded")
-        )
-        if _is_transient:
-            print(f"[LLM] Groq/OpenAI stream {status} - falling back to Ollama llama3.2 stream, Sir...")
-            # Yield from Ollama stream as fallback
-            fallback = _ollama_fallback_call(messages, tools, timeout)
-            yield {"type": "sentence", "text": fallback["content"]}
-            yield {"type": "done", "content": fallback["content"], "tool_calls": fallback["tool_calls"]}
-            return
-        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
     except Exception as e:
+        print(f"[LLM] OpenAI/Groq stream failed ({type(e).__name__}: {e}) - falling back to Ollama/Gemini stream, Sir...")
+        try:
+            fallback = _ollama_fallback_call(messages, tools, timeout)
+            ans = fallback.get("content", "")
+            if ans:
+                yield {"type": "sentence", "text": ans}
+                yield {"type": "done", "content": ans, "tool_calls": fallback.get("tool_calls", [])}
+                return
+        except Exception as fb_err:
+            print(f"[LLM] Stream fallback failed: {fb_err}")
         raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
 
 
@@ -960,6 +963,13 @@ def call_llm_stream(
         messages = msg_list
 
     provider = get_llm_provider()
+    if provider == "gemini":
+        fb = _gemini_fallback_call(messages, tools, timeout)
+        ans = fb.get("content", "")
+        if ans:
+            yield {"type": "sentence", "text": ans}
+            yield {"type": "done", "content": ans, "tool_calls": fb.get("tool_calls", [])}
+        return
     if provider == "claude":
         yield from _stream_claude(messages, tools, timeout)
         return
@@ -1030,28 +1040,15 @@ def call_llm_stream(
 
     try:
         yield from _do_stream()
-    except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] Stream ConnectionError — trying to restart Ollama… ({e})")
-        if ensure_ollama_running():
-            yield from _do_stream()
-            return
-        raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
-            "Make sure Ollama is installed and run: ollama serve"
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Ollama stream timed out.")
-    except requests.exceptions.HTTPError as e:
-        err_detail = ""
-        try:
-            err_detail = e.response.json().get("error", "")
-        except Exception:
-            err_detail = e.response.text if e.response is not None else ""
-        if e.response is not None and e.response.status_code == 404:
-            print(f"[LLM] HTTP 404 Not Found from {endpoint}: {err_detail or 'Model or endpoint not found'}")
-            raise RuntimeError(f"Ollama HTTP 404 Not Found: {err_detail or f'Model {model} not found'}")
-        print(f"[LLM] HTTPError: {e.response.status_code if e.response else 'unknown'} — {err_detail[:200]}")
-        raise RuntimeError(f"Ollama HTTP error {e.response.status_code if e.response else 'unknown'}: {err_detail or e}")
     except Exception as e:
-        print(f"[LLM] Stream error: {type(e).__name__}: {e}")
+        print(f"[LLM] Ollama stream unavailable ({type(e).__name__}: {e}) — trying Gemini REST fallback...")
+        try:
+            fb = _gemini_fallback_call(messages, tools, timeout)
+            ans = fb.get("content", "")
+            if ans:
+                yield {"type": "sentence", "text": ans}
+                yield {"type": "done", "content": ans, "tool_calls": fb.get("tool_calls", [])}
+                return
+        except Exception as fb_err:
+            print(f"[LLM] Gemini REST fallback error: {fb_err}")
         raise RuntimeError(f"LLM stream failed: {e}")
